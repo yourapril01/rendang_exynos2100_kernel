@@ -531,9 +531,6 @@ static int firmware_param_path_get(char *buffer, const struct kernel_param *kp)
 			count += scnprintf(buffer + count, PATH_SIZE, "%s%s", fw_path_para[i], ",");
 	}
 
-	if (count == 0)
-		return 0;
-
 	buffer[count - 1] = '\0';
 
 	return count - 1;
@@ -1614,9 +1611,8 @@ static void device_cache_fw_images(void)
 
 	mutex_lock(&fw_lock);
 	fwc->state = FW_LOADER_START_CACHE;
-	mutex_unlock(&fw_lock);
-
 	dpm_for_each_dev(NULL, dev_cache_fw_image);
+	mutex_unlock(&fw_lock);
 
 	/* wait for completion of caching firmware for all devices */
 	async_synchronize_full_domain(&fw_cache_domain);

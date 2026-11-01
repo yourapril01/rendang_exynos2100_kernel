@@ -4760,9 +4760,9 @@ fail:
 	return r;
 }
 
-static int gfx_v9_0_early_init(struct amdgpu_ip_block *ip_block)
+static int gfx_v9_0_early_init(void *handle)
 {
-	struct amdgpu_device *adev = ip_block->adev;
+	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
 
 	adev->gfx.funcs = &gfx_v9_0_gfx_funcs;
 
@@ -5636,6 +5636,9 @@ static void gfx_v9_0_ring_emit_fence_kiq(struct amdgpu_ring *ring, u64 addr,
 					 u64 seq, unsigned int flags)
 {
 	struct amdgpu_device *adev = ring->adev;
+
+	/* we only allocate 32bit for each seq wb address */
+	BUG_ON(flags & AMDGPU_FENCE_FLAG_64BIT);
 
 	/* write fence seq to the "addr" */
 	amdgpu_ring_write(ring, PACKET3(PACKET3_WRITE_DATA, 3));
@@ -7315,8 +7318,8 @@ static int gfx_v9_0_reset_kcq(struct amdgpu_ring *ring,
 	}
 	kiq->pmf->kiq_map_queues(kiq_ring, ring);
 	amdgpu_ring_commit(kiq_ring);
-	r = amdgpu_ring_test_ring(kiq_ring);
 	spin_unlock_irqrestore(&kiq->ring_lock, flags);
+	r = amdgpu_ring_test_ring(kiq_ring);
 	if (r) {
 		DRM_ERROR("fail to remap queue\n");
 		return r;
@@ -7364,9 +7367,9 @@ static void gfx_v9_ip_print(void *handle, struct drm_printer *p)
 
 }
 
-static void gfx_v9_ip_dump(struct amdgpu_ip_block *ip_block)
+static void gfx_v9_ip_dump(void *handle)
 {
-	struct amdgpu_device *adev = ip_block->adev;
+	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
 	uint32_t i, j, k, reg, index = 0;
 	uint32_t reg_count = ARRAY_SIZE(gc_reg_list_9);
 

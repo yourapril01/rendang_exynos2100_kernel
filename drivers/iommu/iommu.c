@@ -2694,25 +2694,22 @@ ssize_t iommu_map_sg(struct iommu_domain *domain, unsigned long iova,
 
 	if (deferred_sg) {
 		cookie_sg = ops->alloc_cookie_sg(iova, prot, nents, gfp);
-		if (cookie_sg)
-			cookie_sg->domain = domain;
-		else
-			deferred_sg = false;
+		if (!cookie_sg) {
+			pr_err("iommu: failed alloc cookie\n");
+			return -ENOMEM;
+		}
+		cookie_sg->domain = domain;
 	}
 
 	while (i <= nents) {
 		phys_addr_t s_phys = sg_phys(sg);
 
 		if (len && s_phys != start + len) {
-			if (deferred_sg) {
+			if (deferred_sg)
 				ret = __iommu_add_sg(cookie_sg, iova + mapped, start, len);
-				/* Override mapped with the actual value and free the lists. */
-				if (ret)
-					mapped = ops->consume_deferred_map_sg(cookie_sg);
-			} else {
+			else
 				ret = iommu_map_nosync(domain, iova + mapped, start,
 						  len, prot, gfp);
-			}
 			if (ret)
 				goto out_err;
 
@@ -3427,11 +3424,9 @@ static int __iommu_set_group_pasid(struct iommu_domain *domain,
 	int ret;
 
 	for_each_group_device(group, device) {
-		if (device->dev->iommu->max_pasids > 0) {
-			ret = domain->ops->set_dev_pasid(domain, device->dev, pasid);
-			if (ret)
-				goto err_revert;
-		}
+		ret = domain->ops->set_dev_pasid(domain, device->dev, pasid);
+		if (ret)
+			goto err_revert;
 	}
 
 	return 0;
@@ -3443,8 +3438,7 @@ err_revert:
 
 		if (device == last_gdev)
 			break;
-		if (device->dev->iommu->max_pasids > 0)
-			ops->remove_dev_pasid(device->dev, pasid, domain);
+		ops->remove_dev_pasid(device->dev, pasid, domain);
 	}
 	return ret;
 }
@@ -3457,10 +3451,8 @@ static void __iommu_remove_group_pasid(struct iommu_group *group,
 	const struct iommu_ops *ops;
 
 	for_each_group_device(group, device) {
-		if (device->dev->iommu->max_pasids > 0) {
-			ops = dev_iommu_ops(device->dev);
-			ops->remove_dev_pasid(device->dev, pasid, domain);
-		}
+		ops = dev_iommu_ops(device->dev);
+		ops->remove_dev_pasid(device->dev, pasid, domain);
 	}
 }
 
@@ -3494,13 +3486,7 @@ int iommu_attach_device_pasid(struct iommu_domain *domain,
 
 	mutex_lock(&group->mutex);
 	for_each_group_device(group, device) {
-		/*
-		 * Skip PASID validation for devices without PASID support
-		 * (max_pasids = 0). These devices cannot issue transactions
-		 * with PASID, so they don't affect group's PASID usage.
-		 */
-		if ((device->dev->iommu->max_pasids > 0) &&
-		    (pasid >= device->dev->iommu->max_pasids)) {
+		if (pasid >= device->dev->iommu->max_pasids) {
 			ret = -EINVAL;
 			goto out_unlock;
 		}

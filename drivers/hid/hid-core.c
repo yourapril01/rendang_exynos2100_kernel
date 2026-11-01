@@ -46,41 +46,6 @@ module_param_named(ignore_special_drivers, hid_ignore_special_drivers, int, 0600
 MODULE_PARM_DESC(ignore_special_drivers, "Ignore any special drivers and handle all devices by generic driver");
 
 /*
- * Convert a signed n-bit integer to signed 32-bit integer.
- */
-
-static s32 snto32(__u32 value, unsigned int n)
-{
-	if (!value || !n)
-		return 0;
-
-	if (n > 32)
-		n = 32;
-
-	return sign_extend32(value, n - 1);
-}
-
-/*
- * Convert a signed 32-bit integer to a signed n-bit integer.
- */
-
-static u32 s32ton(__s32 value, unsigned int n)
-{
-	s32 a;
-
-	if (!value || !n)
-		return 0;
-
-	if (n > 32)
-		n = 32;
-
-	a = value >> (n - 1);
-	if (a && a != -1)
-		return value < 0 ? 1 << (n - 1) : (1 << (n - 1)) - 1;
-	return value & ((1 << n) - 1);
-}
-
-/*
  * Register a new report for a device.
  */
 
@@ -460,7 +425,7 @@ static int hid_parser_global(struct hid_parser *parser, struct hid_item *item)
 		 * both this and the standard encoding. */
 		raw_value = item_sdata(item);
 		if (!(raw_value & 0xfffffff0))
-			parser->global.unit_exponent = snto32(raw_value, 4);
+			parser->global.unit_exponent = hid_snto32(raw_value, 4);
 		else
 			parser->global.unit_exponent = raw_value;
 		return 0;
@@ -1353,6 +1318,46 @@ alloc_err:
 EXPORT_SYMBOL_GPL(hid_open_report);
 
 /*
+ * Convert a signed n-bit integer to signed 32-bit integer. Common
+ * cases are done through the compiler, the screwed things has to be
+ * done by hand.
+ */
+
+static s32 snto32(__u32 value, unsigned n)
+{
+	if (!value || !n)
+		return 0;
+
+	if (n > 32)
+		n = 32;
+
+	switch (n) {
+	case 8:  return ((__s8)value);
+	case 16: return ((__s16)value);
+	case 32: return ((__s32)value);
+	}
+	return value & (1 << (n - 1)) ? value | (~0U << n) : value;
+}
+
+s32 hid_snto32(__u32 value, unsigned n)
+{
+	return snto32(value, n);
+}
+EXPORT_SYMBOL_GPL(hid_snto32);
+
+/*
+ * Convert a signed 32-bit integer to a signed n-bit integer.
+ */
+
+static u32 s32ton(__s32 value, unsigned n)
+{
+	s32 a = value >> (n - 1);
+	if (a && a != -1)
+		return value < 0 ? 1 << (n - 1) : (1 << (n - 1)) - 1;
+	return value & ((1 << n) - 1);
+}
+
+/*
  * Extract/implement a data field from/to a little endian report (bit array).
  *
  * Code sort-of follows HID spec:
@@ -1868,12 +1873,9 @@ u8 *hid_alloc_report_buf(struct hid_report *report, gfp_t flags)
 	/*
 	 * 7 extra bytes are necessary to achieve proper functionality
 	 * of implement() working on 8 byte chunks
-	 * 1 extra byte for the report ID if it is null (not used) so
-	 * we can reserve that extra byte in the first position of the buffer
-	 * when sending it to .raw_request()
 	 */
 
-	u32 len = hid_report_len(report) + 7 + (report->id == 0);
+	u32 len = hid_report_len(report) + 7;
 
 	return kzalloc(len, flags);
 }
@@ -1961,7 +1963,7 @@ static struct hid_report *hid_get_report(struct hid_report_enum *report_enum,
 int __hid_request(struct hid_device *hid, struct hid_report *report,
 		enum hid_class_request reqtype)
 {
-	char *buf, *data_buf;
+	char *buf;
 	int ret;
 	u32 len;
 
@@ -1969,19 +1971,13 @@ int __hid_request(struct hid_device *hid, struct hid_report *report,
 	if (!buf)
 		return -ENOMEM;
 
-	data_buf = buf;
 	len = hid_report_len(report);
 
-	if (report->id == 0) {
-		/* reserve the first byte for the report ID */
-		data_buf++;
-		len++;
-	}
-
 	if (reqtype == HID_REQ_SET_REPORT)
-		hid_output_report(report, data_buf);
+		hid_output_report(report, buf);
 
-	ret = hid_hw_raw_request(hid, report->id, buf, len, report->type, reqtype);
+	ret = hid->ll_driver->raw_request(hid, report->id, buf, len,
+					  report->type, reqtype);
 	if (ret < 0) {
 		dbg_hid("unable to complete request: %d\n", ret);
 		goto out;
@@ -1998,39 +1994,24 @@ out:
 }
 EXPORT_SYMBOL_GPL(__hid_request);
 
-int __hid_report_raw_event(struct hid_device *hid, enum hid_report_type type, u8 *data,
-			   size_t bufsize, u32 size, int interrupt)
+int hid_report_raw_event(struct hid_device *hid, enum hid_report_type type, u8 *data, u32 size,
+			 int interrupt)
 {
 	struct hid_report_enum *report_enum = hid->report_enum + type;
 	struct hid_report *report;
 	struct hid_driver *hdrv;
 	int max_buffer_size = HID_MAX_BUFFER_SIZE;
 	u32 rsize, csize = size;
-	size_t bsize = bufsize;
 	u8 *cdata = data;
 	int ret = 0;
 
-	if (report_enum->numbered && (size < 1 || bufsize < 1)) {
-		hid_warn_ratelimited(hid,
-				     "Event data for numbered report is too short (%d vs %zu)\n",
-				     size, bufsize);
-		return -EINVAL;
-	}
-
 	report = hid_get_report(report_enum, data);
 	if (!report)
-		return 0;
-
-	if (unlikely(bsize < csize)) {
-		hid_warn_ratelimited(hid, "Event data for report %d is incorrect (%d vs %zu)\n",
-				     report->id, csize, bsize);
-		return -EINVAL;
-	}
+		goto out;
 
 	if (report_enum->numbered) {
 		cdata++;
 		csize--;
-		bsize--;
 	}
 
 	rsize = hid_compute_report_size(report);
@@ -2043,15 +2024,9 @@ int __hid_report_raw_event(struct hid_device *hid, enum hid_report_type type, u8
 	else if (rsize > max_buffer_size)
 		rsize = max_buffer_size;
 
-	if (bsize < rsize) {
-		hid_warn_ratelimited(hid, "Event data for report %d was too short (%d vs %zu)\n",
-				     report->id, rsize, bsize);
-		return -EINVAL;
-	}
-
 	if (csize < rsize) {
 		dbg_hid("report %d is too short, (%d < %d)\n", report->id,
-			csize, rsize);
+				csize, rsize);
 		memset(cdata + csize, 0, rsize - csize);
 	}
 
@@ -2060,7 +2035,7 @@ int __hid_report_raw_event(struct hid_device *hid, enum hid_report_type type, u8
 	if (hid->claimed & HID_CLAIMED_HIDRAW) {
 		ret = hidraw_report_event(hid, data, size);
 		if (ret)
-			return ret;
+			goto out;
 	}
 
 	if (hid->claimed != HID_CLAIMED_HIDRAW && report->maxfield) {
@@ -2072,22 +2047,15 @@ int __hid_report_raw_event(struct hid_device *hid, enum hid_report_type type, u8
 
 	if (hid->claimed & HID_CLAIMED_INPUT)
 		hidinput_report_event(hid, report);
-
+out:
 	return ret;
-}
-EXPORT_SYMBOL_GPL(__hid_report_raw_event);
-
-int hid_report_raw_event(struct hid_device *hid, enum hid_report_type type, u8 *data, u32 size,
-			 int interrupt)
-{
-	return __hid_report_raw_event(hid, type, data, size, size, interrupt);
 }
 EXPORT_SYMBOL_GPL(hid_report_raw_event);
 
 
 static int __hid_input_report(struct hid_device *hid, enum hid_report_type type,
-			      u8 *data, size_t bufsize, u32 size, int interrupt, u64 source,
-			      bool from_bpf, bool lock_already_taken)
+			      u8 *data, u32 size, int interrupt, u64 source, bool from_bpf,
+			      bool lock_already_taken)
 {
 	struct hid_report_enum *report_enum;
 	struct hid_driver *hdrv;
@@ -2112,8 +2080,7 @@ static int __hid_input_report(struct hid_device *hid, enum hid_report_type type,
 	report_enum = hid->report_enum + type;
 	hdrv = hid->driver;
 
-	data = dispatch_hid_bpf_device_event(hid, type, data, &bufsize, &size, interrupt,
-					     source, from_bpf);
+	data = dispatch_hid_bpf_device_event(hid, type, data, &size, interrupt, source, from_bpf);
 	if (IS_ERR(data)) {
 		ret = PTR_ERR(data);
 		goto unlock;
@@ -2142,7 +2109,7 @@ static int __hid_input_report(struct hid_device *hid, enum hid_report_type type,
 			goto unlock;
 	}
 
-	ret = __hid_report_raw_event(hid, type, data, bufsize, size, interrupt);
+	ret = hid_report_raw_event(hid, type, data, size, interrupt);
 
 unlock:
 	if (!lock_already_taken)
@@ -2160,40 +2127,15 @@ unlock:
  * @interrupt: distinguish between interrupt and control transfers
  *
  * This is data entry for lower layers.
- * Legacy, please use hid_safe_input_report() instead.
  */
 int hid_input_report(struct hid_device *hid, enum hid_report_type type, u8 *data, u32 size,
 		     int interrupt)
 {
-	return __hid_input_report(hid, type, data, size, size, interrupt, 0,
+	return __hid_input_report(hid, type, data, size, interrupt, 0,
 				  false, /* from_bpf */
 				  false /* lock_already_taken */);
 }
 EXPORT_SYMBOL_GPL(hid_input_report);
-
-/**
- * hid_safe_input_report - report data from lower layer (usb, bt...)
- *
- * @hid: hid device
- * @type: HID report type (HID_*_REPORT)
- * @data: report contents
- * @bufsize: allocated size of the data buffer
- * @size: useful size of data parameter
- * @interrupt: distinguish between interrupt and control transfers
- *
- * This is data entry for lower layers.
- * Please use this function instead of the non safe version because we provide
- * here the size of the buffer, allowing hid-core to make smarter decisions
- * regarding the incoming buffer.
- */
-int hid_safe_input_report(struct hid_device *hid, enum hid_report_type type, u8 *data,
-			  size_t bufsize, u32 size, int interrupt)
-{
-	return __hid_input_report(hid, type, data, bufsize, size, interrupt, 0,
-				  false, /* from_bpf */
-				  false /* lock_already_taken */);
-}
-EXPORT_SYMBOL_GPL(hid_safe_input_report);
 
 bool hid_match_one_id(const struct hid_device *hdev,
 		      const struct hid_device_id *id)

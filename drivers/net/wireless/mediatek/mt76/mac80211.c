@@ -1188,7 +1188,7 @@ mt76_check_ccmp_pn(struct sk_buff *skb)
 		 * All further fragments will be validated by mac80211 only.
 		 */
 		if (ieee80211_is_frag(hdr) &&
-		    !ieee80211_is_first_frag(hdr->seq_ctrl))
+		    !ieee80211_is_first_frag(hdr->frame_control))
 			return;
 	}
 
@@ -1585,10 +1585,6 @@ void mt76_wcid_cleanup(struct mt76_dev *dev, struct mt76_wcid *wcid)
 	spin_lock(&wcid->tx_pending.lock);
 	skb_queue_splice_tail_init(&wcid->tx_pending, &list);
 	spin_unlock(&wcid->tx_pending.lock);
-
-	spin_lock(&wcid->tx_offchannel.lock);
-	skb_queue_splice_tail_init(&wcid->tx_offchannel, &list);
-	spin_unlock(&wcid->tx_offchannel.lock);
 
 	spin_unlock_bh(&phy->tx_lock);
 

@@ -92,7 +92,7 @@ static int serio_raw_open(struct inode *inode, struct file *file)
 		goto out;
 	}
 
-	client = kzalloc(sizeof(*client), GFP_KERNEL);
+	client = kzalloc(sizeof(struct serio_raw_client), GFP_KERNEL);
 	if (!client) {
 		retval = -ENOMEM;
 		goto out;
@@ -159,7 +159,7 @@ static ssize_t serio_raw_read(struct file *file, char __user *buffer,
 {
 	struct serio_raw_client *client = file->private_data;
 	struct serio_raw *serio_raw = client->serio_raw;
-	char c;
+	char uninitialized_var(c);
 	ssize_t read = 0;
 	int error;
 
@@ -293,7 +293,7 @@ static int serio_raw_connect(struct serio *serio, struct serio_driver *drv)
 	struct serio_raw *serio_raw;
 	int err;
 
-	serio_raw = kzalloc(sizeof(*serio_raw), GFP_KERNEL);
+	serio_raw = kzalloc(sizeof(struct serio_raw), GFP_KERNEL);
 	if (!serio_raw) {
 		dev_dbg(&serio->dev, "can't allocate memory for a device\n");
 		return -ENOMEM;

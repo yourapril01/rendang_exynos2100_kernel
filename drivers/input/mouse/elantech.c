@@ -17,7 +17,7 @@
 #include <linux/platform_device.h>
 #include <linux/serio.h>
 #include <linux/libps2.h>
-#include <linux/unaligned.h>
+#include <asm/unaligned.h>
 #include "psmouse.h"
 #include "elantech.h"
 #include "elan_i2c.h"
@@ -424,7 +424,7 @@ static void elantech_report_absolute_v2(struct psmouse *psmouse)
 		 */
 		if (packet[3] & 0x80)
 			fingers = 4;
-		fallthrough;
+		/* fall through */
 	case 1:
 		/*
 		 * byte 1:  .   .   .   .  x11 x10 x9  x8
@@ -674,11 +674,10 @@ static void process_packet_head_v4(struct psmouse *psmouse)
 	struct input_dev *dev = psmouse->dev;
 	struct elantech_data *etd = psmouse->private;
 	unsigned char *packet = psmouse->packet;
-	int id;
+	int id = ((packet[3] & 0xe0) >> 5) - 1;
 	int pres, traces;
 
-	id = ((packet[3] & 0xe0) >> 5) - 1;
-	if (id < 0 || id >= ETP_MAX_FINGERS)
+	if (id < 0)
 		return;
 
 	etd->mt[id].x = ((packet[1] & 0x0f) << 8) | packet[2];
@@ -708,7 +707,7 @@ static void process_packet_motion_v4(struct psmouse *psmouse)
 	int id, sid;
 
 	id = ((packet[0] & 0xe0) >> 5) - 1;
-	if (id < 0 || id >= ETP_MAX_FINGERS)
+	if (id < 0)
 		return;
 
 	sid = ((packet[3] & 0xe0) >> 5) - 1;
@@ -729,7 +728,7 @@ static void process_packet_motion_v4(struct psmouse *psmouse)
 	input_report_abs(dev, ABS_MT_POSITION_X, etd->mt[id].x);
 	input_report_abs(dev, ABS_MT_POSITION_Y, etd->mt[id].y);
 
-	if (sid >= 0 && sid < ETP_MAX_FINGERS) {
+	if (sid >= 0) {
 		etd->mt[sid].x += delta_x2 * weight;
 		etd->mt[sid].y -= delta_y2 * weight;
 		input_mt_slot(dev, sid);
@@ -1201,7 +1200,7 @@ static int elantech_set_input_params(struct psmouse *psmouse)
 	case 2:
 		__set_bit(BTN_TOOL_QUADTAP, dev->keybit);
 		__set_bit(INPUT_PROP_SEMI_MT, dev->propbit);
-		fallthrough;
+		/* fall through */
 	case 3:
 		if (info->hw_version == 3)
 			elantech_set_buttonpad_prop(psmouse);
@@ -1477,45 +1476,14 @@ static void elantech_disconnect(struct psmouse *psmouse)
 }
 
 /*
- * Some hw_version 4 models fail to properly activate absolute mode on
- * resume without going through disable/enable cycle.
- */
-static const struct dmi_system_id elantech_needs_reenable[] = {
-#if defined(CONFIG_DMI) && defined(CONFIG_X86)
-	{
-		/* Lenovo N24 */
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
-			DMI_MATCH(DMI_PRODUCT_NAME, "81AF"),
-		},
-	},
-#endif
-	{ }
-};
-
-/*
  * Put the touchpad back into absolute mode when reconnecting
  */
 static int elantech_reconnect(struct psmouse *psmouse)
 {
-	int err;
-
 	psmouse_reset(psmouse);
 
 	if (elantech_detect(psmouse, 0))
 		return -1;
-
-	if (dmi_check_system(elantech_needs_reenable)) {
-		err = ps2_command(&psmouse->ps2dev, NULL, PSMOUSE_CMD_DISABLE);
-		if (err)
-			psmouse_warn(psmouse, "failed to deactivate mouse on %s: %d\n",
-				     psmouse->ps2dev.serio->phys, err);
-
-		err = ps2_command(&psmouse->ps2dev, NULL, PSMOUSE_CMD_ENABLE);
-		if (err)
-			psmouse_warn(psmouse, "failed to reactivate mouse on %s: %d\n",
-				     psmouse->ps2dev.serio->phys, err);
-	}
 
 	if (elantech_set_absolute_mode(psmouse)) {
 		psmouse_err(psmouse,
@@ -1936,6 +1904,8 @@ static int elantech_create_smbus(struct psmouse *psmouse,
 	};
 	unsigned int idx = 0;
 
+	smbus_board.properties = i2c_props;
+
 	i2c_props[idx++] = PROPERTY_ENTRY_U32("touchscreen-size-x",
 						   info->x_max + 1);
 	i2c_props[idx++] = PROPERTY_ENTRY_U32("touchscreen-size-y",
@@ -1967,15 +1937,11 @@ static int elantech_create_smbus(struct psmouse *psmouse,
 	if (elantech_is_buttonpad(info))
 		i2c_props[idx++] = PROPERTY_ENTRY_BOOL("elan,clickpad");
 
-	smbus_board.fwnode = fwnode_create_software_node(i2c_props, NULL);
-	if (IS_ERR(smbus_board.fwnode))
-		return PTR_ERR(smbus_board.fwnode);
-
 	return psmouse_smbus_init(psmouse, &smbus_board, NULL, 0, false,
 				  leave_breadcrumbs);
 }
 
-/*
+/**
  * elantech_setup_smbus - called once the PS/2 devices are enumerated
  * and decides to instantiate a SMBus InterTouch device.
  */
@@ -2025,10 +1991,12 @@ static bool elantech_use_host_notify(struct psmouse *psmouse,
 		/* expected case */
 		break;
 	case ETP_BUS_SMB_ALERT_ONLY:
+		/* fall-through  */
 	case ETP_BUS_PS2_SMB_ALERT:
 		psmouse_dbg(psmouse, "Ignoring SMBus provider through alert protocol.\n");
 		break;
 	case ETP_BUS_SMB_HST_NTFY_ONLY:
+		/* fall-through  */
 	case ETP_BUS_PS2_SMB_HST_NTFY:
 		return true;
 	default:
@@ -2043,7 +2011,7 @@ static bool elantech_use_host_notify(struct psmouse *psmouse,
 int elantech_init_smbus(struct psmouse *psmouse)
 {
 	struct elantech_device_info info;
-	int error;
+	int error = -EINVAL;
 
 	psmouse_reset(psmouse);
 
@@ -2145,7 +2113,6 @@ static int elantech_setup_ps2(struct psmouse *psmouse,
 	psmouse->protocol_handler = elantech_process_byte;
 	psmouse->disconnect = elantech_disconnect;
 	psmouse->reconnect = elantech_reconnect;
-	psmouse->fast_reconnect = NULL;
 	psmouse->pktsize = info->hw_version > 1 ? 6 : 4;
 
 	return 0;
@@ -2162,7 +2129,7 @@ static int elantech_setup_ps2(struct psmouse *psmouse,
 int elantech_init_ps2(struct psmouse *psmouse)
 {
 	struct elantech_device_info info;
-	int error;
+	int error = -EINVAL;
 
 	psmouse_reset(psmouse);
 
@@ -2183,7 +2150,7 @@ int elantech_init_ps2(struct psmouse *psmouse)
 int elantech_init(struct psmouse *psmouse)
 {
 	struct elantech_device_info info;
-	int error;
+	int error = -EINVAL;
 
 	psmouse_reset(psmouse);
 

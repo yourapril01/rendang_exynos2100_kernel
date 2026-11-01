@@ -4835,62 +4835,55 @@ static void break_stripe_batch_list(struct stripe_head *head_sh,
 {
 	struct stripe_head *sh, *next;
 	int i;
-	unsigned long state;
 
 	list_for_each_entry_safe(sh, next, &head_sh->batch_list, batch_list) {
 
 		list_del_init(&sh->batch_list);
 
-		state = READ_ONCE(sh->state);
-		WARN_ONCE(state & ((1 << STRIPE_ACTIVE) |
-				   (1 << STRIPE_SYNCING) |
-				   (1 << STRIPE_REPLACED) |
-				   (1 << STRIPE_DELAYED) |
-				   (1 << STRIPE_BIT_DELAY) |
-				   (1 << STRIPE_FULL_WRITE) |
-				   (1 << STRIPE_BIOFILL_RUN) |
-				   (1 << STRIPE_COMPUTE_RUN)  |
-				   (1 << STRIPE_DISCARD) |
-				   (1 << STRIPE_BATCH_READY) |
-				   (1 << STRIPE_BATCH_ERR)),
-			"stripe state: %lx\n", state);
-
-		state = READ_ONCE(head_sh->state);
-		WARN_ONCE(state & ((1 << STRIPE_DISCARD) |
-				   (1 << STRIPE_REPLACED)),
-			"head stripe state: %lx\n", state);
+		WARN_ONCE(sh->state & ((1 << STRIPE_ACTIVE) |
+					  (1 << STRIPE_SYNCING) |
+					  (1 << STRIPE_REPLACED) |
+					  (1 << STRIPE_DELAYED) |
+					  (1 << STRIPE_BIT_DELAY) |
+					  (1 << STRIPE_FULL_WRITE) |
+					  (1 << STRIPE_BIOFILL_RUN) |
+					  (1 << STRIPE_COMPUTE_RUN)  |
+					  (1 << STRIPE_DISCARD) |
+					  (1 << STRIPE_BATCH_READY) |
+					  (1 << STRIPE_BATCH_ERR)),
+			"stripe state: %lx\n", sh->state);
+		WARN_ONCE(head_sh->state & ((1 << STRIPE_DISCARD) |
+					      (1 << STRIPE_REPLACED)),
+			"head stripe state: %lx\n", head_sh->state);
 
 		set_mask_bits(&sh->state, ~(STRIPE_EXPAND_SYNC_FLAGS |
 					    (1 << STRIPE_PREREAD_ACTIVE) |
 					    (1 << STRIPE_ON_UNPLUG_LIST)),
-			      state & (1 << STRIPE_INSYNC));
+			      head_sh->state & (1 << STRIPE_INSYNC));
 
 		sh->check_state = head_sh->check_state;
 		sh->reconstruct_state = head_sh->reconstruct_state;
 		spin_lock_irq(&sh->stripe_lock);
+		sh->batch_head = NULL;
+		spin_unlock_irq(&sh->stripe_lock);
 		for (i = 0; i < sh->disks; i++) {
 			if (test_and_clear_bit(R5_Overlap, &sh->dev[i].flags))
 				wake_up_bit(&sh->dev[i].flags, R5_Overlap);
-			sh->dev[i].flags = READ_ONCE(head_sh->dev[i].flags) &
+			sh->dev[i].flags = head_sh->dev[i].flags &
 				(~((1 << R5_WriteError) | (1 << R5_Overlap)));
 		}
-		sh->batch_head = NULL;
-		spin_unlock_irq(&sh->stripe_lock);
-
-		state = READ_ONCE(sh->state);
-		if (handle_flags == 0 || (state & handle_flags))
+		if (handle_flags == 0 ||
+		    sh->state & handle_flags)
 			set_bit(STRIPE_HANDLE, &sh->state);
 		raid5_release_stripe(sh);
 	}
 	spin_lock_irq(&head_sh->stripe_lock);
+	head_sh->batch_head = NULL;
+	spin_unlock_irq(&head_sh->stripe_lock);
 	for (i = 0; i < head_sh->disks; i++)
 		if (test_and_clear_bit(R5_Overlap, &head_sh->dev[i].flags))
 			wake_up_bit(&head_sh->dev[i].flags, R5_Overlap);
-	head_sh->batch_head = NULL;
-	spin_unlock_irq(&head_sh->stripe_lock);
-
-	state = READ_ONCE(head_sh->state);
-	if (state & handle_flags)
+	if (head_sh->state & handle_flags)
 		set_bit(STRIPE_HANDLE, &head_sh->state);
 }
 
@@ -4954,8 +4947,7 @@ static void handle_stripe(struct stripe_head *sh)
 		goto finish;
 
 	if (s.handle_bad_blocks ||
-	    (md_is_rdwr(conf->mddev) &&
-	     test_bit(MD_SB_CHANGE_PENDING, &conf->mddev->sb_flags))) {
+	    test_bit(MD_SB_CHANGE_PENDING, &conf->mddev->sb_flags)) {
 		set_bit(STRIPE_HANDLE, &sh->state);
 		goto finish;
 	}
@@ -5492,10 +5484,8 @@ static struct bio *chunk_aligned_read(struct mddev *mddev, struct bio *raid_bio)
 
 	if (sectors < bio_sectors(raid_bio)) {
 		struct r5conf *conf = mddev->private;
-
 		split = bio_split(raid_bio, sectors, GFP_NOIO, &conf->bio_split);
 		bio_chain(split, raid_bio);
-		trace_block_split(split, raid_bio->bi_iter.bi_sector);
 		submit_bio_noacct(raid_bio);
 		raid_bio = split;
 	}
@@ -6632,13 +6622,7 @@ static int  retry_aligned_read(struct r5conf *conf, struct bio *raid_bio,
 		}
 
 		if (!add_stripe_bio(sh, raid_bio, dd_idx, 0, 0)) {
-			int hash;
-
-			spin_lock_irq(&conf->device_lock);
-			hash = sh->hash_lock_index;
-			__release_stripe(conf, sh,
-					 &conf->temp_inactive_list[hash]);
-			spin_unlock_irq(&conf->device_lock);
+			raid5_release_stripe(sh);
 			conf->retry_read_aligned = raid_bio;
 			conf->retry_read_offset = scnt;
 			return handled;
@@ -6777,8 +6761,7 @@ static void raid5d(struct md_thread *thread)
 		int batch_size, released;
 		unsigned int offset;
 
-		if (md_is_rdwr(mddev) &&
-		    test_bit(MD_SB_CHANGE_PENDING, &mddev->sb_flags))
+		if (test_bit(MD_SB_CHANGE_PENDING, &mddev->sb_flags))
 			break;
 
 		released = release_stripe_list(conf, conf->temp_inactive_list);
@@ -7194,14 +7177,12 @@ raid5_store_group_thread_cnt(struct mddev *mddev, const char *page, size_t len)
 	err = mddev_suspend_and_lock(mddev);
 	if (err)
 		return err;
-	conf = mddev->private;
-	if (!conf) {
-		mddev_unlock_and_resume(mddev);
-		return -ENODEV;
-	}
 	raid5_quiesce(mddev, true);
 
-	if (new != conf->worker_cnt_per_group) {
+	conf = mddev->private;
+	if (!conf)
+		err = -ENODEV;
+	else if (new != conf->worker_cnt_per_group) {
 		old_groups = conf->worker_groups;
 		if (old_groups)
 			flush_workqueue(raid5_wq);
@@ -8062,8 +8043,7 @@ static int raid5_run(struct mddev *mddev)
 			goto abort;
 	}
 
-	ret = log_init(conf, journal_dev, raid5_has_ppl(conf));
-	if (ret)
+	if (log_init(conf, journal_dev, raid5_has_ppl(conf)))
 		goto abort;
 
 	return 0;

@@ -228,7 +228,7 @@ static const struct irq_domain_ops dw_pcie_msi_domain_ops = {
 int dw_pcie_allocate_domains(struct dw_pcie_rp *pp)
 {
 	struct dw_pcie *pci = to_dw_pcie_from_pp(pp);
-	struct fwnode_handle *fwnode = dev_fwnode(pci->dev);
+	struct fwnode_handle *fwnode = of_node_to_fwnode(pci->dev->of_node);
 
 	pp->irq_domain = irq_domain_create_linear(fwnode, pp->num_vectors,
 					       &dw_pcie_msi_domain_ops, pp);
@@ -778,14 +778,7 @@ static int dw_pcie_iatu_setup(struct dw_pcie_rp *pp)
 		dev_warn(pci->dev, "Ranges exceed outbound iATU size (%d)\n",
 			 pci->num_ob_windows);
 
-	if (pp->use_atu_msg) {
-		if (pci->num_ob_windows > ++i) {
-			pp->msg_atu_index = i;
-		} else {
-			dev_err(pci->dev, "Cannot add outbound window for MSG TLP\n");
-			return -ENOMEM;
-		}
-	}
+	pp->msg_atu_index = i;
 
 	i = 0;
 	resource_list_for_each_entry(entry, &pp->bridge->dma_ranges) {
@@ -887,17 +880,6 @@ int dw_pcie_setup_rc(struct dw_pcie_rp *pp)
 	dw_pcie_writel_dbi(pci, PCIE_LINK_WIDTH_SPEED_CONTROL, val);
 
 	dw_pcie_dbi_ro_wr_dis(pci);
-
-	/*
-	 * The iMSI-RX module does not support receiving MSI or MSI-X generated
-	 * by the Root Port. If iMSI-RX is used as the MSI controller, remove
-	 * the MSI and MSI-X capabilities of the Root Port to allow the drivers
-	 * to fall back to INTx instead.
-	 */
-	if (pp->has_msi_ctrl && !pp->keep_rp_msi_en) {
-		dw_pcie_remove_capability(pci, PCI_CAP_ID_MSI);
-		dw_pcie_remove_capability(pci, PCI_CAP_ID_MSIX);
-	}
 
 	return 0;
 }
@@ -1002,23 +984,11 @@ int dw_pcie_resume_noirq(struct dw_pcie *pci)
 
 	ret = dw_pcie_start_link(pci);
 	if (ret)
-		goto err_deinit;
+		return ret;
 
 	ret = dw_pcie_wait_for_link(pci);
-	if (ret == -ETIMEDOUT)
-		goto err_stop_link;
-
-	if (pci->pp.ops->post_init)
-		pci->pp.ops->post_init(&pci->pp);
-
-	return 0;
-
-err_stop_link:
-	dw_pcie_stop_link(pci);
-
-err_deinit:
-	if (pci->pp.ops->deinit)
-		pci->pp.ops->deinit(&pci->pp);
+	if (ret)
+		return ret;
 
 	return ret;
 }

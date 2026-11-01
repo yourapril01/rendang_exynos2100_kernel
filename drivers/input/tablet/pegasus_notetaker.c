@@ -63,9 +63,6 @@
 #define BUTTON_PRESSED			0xb5
 #define COMMAND_VERSION			0xa9
 
-/* 1 Status + 1 Color + 2 X + 2 Y = 6 bytes */
-#define NOTETAKER_PACKET_SIZE		6
-
 /* in xy data packet */
 #define BATTERY_NO_REPORT		0x40
 #define BATTERY_LOW			0x41
@@ -149,7 +146,7 @@ static void pegasus_parse_packet(struct pegasus *pegasus)
 	/* xy data */
 	case BATTERY_LOW:
 		dev_warn_once(&dev->dev, "Pen battery low\n");
-		fallthrough;
+		/* fall through */
 
 	case BATTERY_NO_REPORT:
 	case BATTERY_GOOD:
@@ -299,19 +296,7 @@ static int pegasus_probe(struct usb_interface *intf,
 	pegasus->intf = intf;
 
 	pipe = usb_rcvintpipe(dev, endpoint->bEndpointAddress);
-	/* Sanity check that pipe's type matches endpoint's type */
-	if (usb_pipe_type_check(dev, pipe)) {
-		error = -EINVAL;
-		goto err_free_mem;
-	}
-
-	pegasus->data_len = usb_maxpacket(dev, pipe);
-	if (pegasus->data_len < NOTETAKER_PACKET_SIZE) {
-		dev_err(&intf->dev, "packet size is too small (%d)\n",
-			pegasus->data_len);
-		error = -EINVAL;
-		goto err_free_mem;
-	}
+	pegasus->data_len = usb_maxpacket(dev, pipe, usb_pipeout(pipe));
 
 	pegasus->data = usb_alloc_coherent(dev, pegasus->data_len, GFP_KERNEL,
 					   &pegasus->data_dma);
@@ -334,7 +319,7 @@ static int pegasus_probe(struct usb_interface *intf,
 	pegasus->irq->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
 
 	if (dev->manufacturer)
-		strscpy(pegasus->name, dev->manufacturer,
+		strlcpy(pegasus->name, dev->manufacturer,
 			sizeof(pegasus->name));
 
 	if (dev->product) {

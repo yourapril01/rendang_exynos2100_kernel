@@ -9,16 +9,17 @@
 
 use kernel::{
     bindings,
-    fs::LocalFile,
+    fs::{File, LocalFile},
     list::{AtomicTracker, List, ListArc, ListLinks, TryNewListArc},
     prelude::*,
     security,
     seq_file::SeqFile,
     seq_print,
-    sync::{Arc, CondVar, SpinLock},
+    sync::poll::{PollCondVar, PollTable},
+    sync::{Arc, SpinLock},
     task::Task,
     types::{ARef, Either},
-    uaccess::{UserSlice, UserSliceReader},
+    uaccess::UserSlice,
     uapi,
 };
 
@@ -30,7 +31,7 @@ use crate::{
     process::Process,
     ptr_align,
     stats::GLOBAL_STATS,
-    transaction::{Transaction, TransactionInfo},
+    transaction::Transaction,
     BinderReturnWriter, DArc, DLArc, DTRWrap, DeliverCode, DeliverToRead,
 };
 
@@ -38,10 +39,6 @@ use core::{
     mem::size_of,
     sync::atomic::{AtomicU32, Ordering},
 };
-
-fn is_aligned(value: usize, to: usize) -> bool {
-    value % to == 0
-}
 
 /// Stores the layout of the scatter-gather entries. This is used during the `translate_objects`
 /// call and is discarded when it returns.
@@ -73,24 +70,17 @@ struct ScatterGatherEntry {
 }
 
 /// This entry specifies that a fixup should happen at `target_offset` of the
-/// buffer.
-enum PointerFixupEntry {
-    /// A fixup for a `binder_buffer_object`.
-    Fixup {
-        /// The translated pointer to write.
-        pointer_value: u64,
-        /// The offset at which the value should be written. The offset is relative
-        /// to the original buffer.
-        target_offset: usize,
-    },
-    /// A skip for a `binder_fd_array_object`.
-    Skip {
-        /// The number of bytes to skip.
-        skip: usize,
-        /// The offset at which the skip should happen. The offset is relative
-        /// to the original buffer.
-        target_offset: usize,
-    },
+/// buffer. If `skip` is nonzero, then the fixup is a `binder_fd_array_object`
+/// and is applied later. Otherwise if `skip` is zero, then the size of the
+/// fixup is `sizeof::<u64>()` and `pointer_value` is written to the buffer.
+struct PointerFixupEntry {
+    /// The number of bytes to skip, or zero for a `binder_buffer_object` fixup.
+    skip: usize,
+    /// The translated pointer to write when `skip` is zero.
+    pointer_value: u64,
+    /// The offset at which the value should be written. The offset is relative
+    /// to the original buffer.
+    target_offset: usize,
 }
 
 /// Return type of `apply_and_validate_fixup_in_parent`.
@@ -163,8 +153,8 @@ impl ScatterGatherState {
         let sg_entry = match self.sg_entries.get(sg_idx) {
             Some(sg_entry) => sg_entry,
             None => {
-                pr_err_ratelimited!(
-                    "self.ancestors[{}] is {}, but self.sg_entries.len() is {}\n",
+                pr_err!(
+                    "self.ancestors[{}] is {}, but self.sg_entries.len() is {}",
                     ancestors_i,
                     sg_idx,
                     self.sg_entries.len()
@@ -173,8 +163,8 @@ impl ScatterGatherState {
             }
         };
         if sg_entry.fixup_min_offset > parent_offset {
-            pr_warn_ratelimited!(
-                "validate_parent_fixup: fixup_min_offset={}, parent_offset={}\n",
+            pr_warn!(
+                "validate_parent_fixup: fixup_min_offset={}, parent_offset={}",
                 sg_entry.fixup_min_offset,
                 parent_offset
             );
@@ -182,8 +172,8 @@ impl ScatterGatherState {
         }
         let new_min_offset = parent_offset.checked_add(length).ok_or(EINVAL)?;
         if new_min_offset > sg_entry.length {
-            pr_warn_ratelimited!(
-                "validate_parent_fixup: new_min_offset={}, sg_entry.length={}\n",
+            pr_warn!(
+                "validate_parent_fixup: new_min_offset={}, sg_entry.length={}",
                 new_min_offset,
                 sg_entry.length
             );
@@ -228,10 +218,8 @@ impl UnusedBufferSpace {
     }
 }
 
-#[must_use]
 pub(crate) enum PushWorkRes {
     Ok,
-    OkNotifyPoll,
     FailedDead(DLArc<dyn DeliverToRead>),
 }
 
@@ -239,7 +227,6 @@ impl PushWorkRes {
     fn is_ok(&self) -> bool {
         match self {
             PushWorkRes::Ok => true,
-            PushWorkRes::OkNotifyPoll => true,
             PushWorkRes::FailedDead(_) => false,
         }
     }
@@ -284,10 +271,8 @@ const LOOPER_WAITING: u32 = 0x10;
 const LOOPER_WAITING_PROC: u32 = 0x20;
 const LOOPER_POLL: u32 = 0x40;
 
-pub(crate) const LOOPER_VH_MASK: u32 = LOOPER_REGISTERED | LOOPER_ENTERED | LOOPER_EXITED;
-
 impl InnerThread {
-    fn new(pid: i32) -> Result<Self> {
+    fn new() -> Result<Self> {
         fn next_err_id() -> u32 {
             static EE_ID: AtomicU32 = AtomicU32::new(0);
             EE_ID.fetch_add(1, Ordering::Relaxed)
@@ -298,8 +283,8 @@ impl InnerThread {
             looper_need_return: false,
             is_dead: false,
             process_work_list: false,
-            reply_work: ThreadError::try_new(pid)?,
-            return_work: ThreadError::try_new(pid)?,
+            reply_work: ThreadError::try_new()?,
+            return_work: ThreadError::try_new()?,
             work_list: List::new(),
             current_transaction: None,
             extended_error: ExtendedError::new(next_err_id(), BR_OK, 0),
@@ -318,34 +303,29 @@ impl InnerThread {
 
     fn push_work(&mut self, work: DLArc<dyn DeliverToRead>) -> PushWorkRes {
         if self.is_dead {
-            return PushWorkRes::FailedDead(work);
-        }
-        self.work_list.push_back(work);
-        self.process_work_list = true;
-        if self.looper_flags & LOOPER_POLL != 0 {
-            PushWorkRes::OkNotifyPoll
+            PushWorkRes::FailedDead(work)
         } else {
+            self.work_list.push_back(work);
+            self.process_work_list = true;
             PushWorkRes::Ok
         }
     }
 
-    fn push_reply_work(&mut self, code: u32) -> PushWorkRes {
+    fn push_reply_work(&mut self, code: u32) {
         if let Ok(work) = ListArc::try_from_arc(self.reply_work.clone()) {
             work.set_error_code(code);
-            self.push_work(work)
+            self.push_work(work);
         } else {
-            pr_warn_ratelimited!("Thread reply work is already in use.\n");
-            PushWorkRes::Ok
+            pr_warn!("Thread reply work is already in use.");
         }
     }
 
-    fn push_return_work(&mut self, reply: u32) -> PushWorkRes {
+    fn push_return_work(&mut self, reply: u32) {
         if let Ok(work) = ListArc::try_from_arc(self.return_work.clone()) {
             work.set_error_code(reply);
-            self.push_work(work)
+            self.push_work(work);
         } else {
-            pr_warn_ratelimited!("Thread return work is already in use.\n");
-            PushWorkRes::Ok
+            pr_warn!("Thread return work is already in use.");
         }
     }
 
@@ -367,7 +347,7 @@ impl InnerThread {
             return Err(EINVAL);
         }
         // Find a new current transaction for this thread.
-        self.current_transaction = transaction.find_from(thread).cloned();
+        self.current_transaction = transaction.find_from(thread);
         Ok(transaction)
     }
 
@@ -437,12 +417,6 @@ pub(crate) const THREAD_LAYOUT: rb_thread_layout = rb_thread_layout {
     arc_offset: Arc::<Thread>::DATA_OFFSET,
     process: offset_of!(Thread, process),
     id: offset_of!(Thread, id),
-    __bindgen_anon_1: kernel::bindings::rb_thread_layout__bindgen_ty_1 {
-        task: offset_of!(Thread, task),
-    },
-    __kabi_reserved_backport1: 0,
-    __kabi_reserved_backport2: 0,
-    __kabi_reserved_backport3: 0,
 };
 
 /// This represents a thread that's used with binder.
@@ -456,7 +430,7 @@ pub(crate) struct Thread {
     #[pin]
     pub(crate) prio_lock: SpinLock<ThreadPrioState>,
     #[pin]
-    work_condvar: CondVar,
+    work_condvar: PollCondVar,
     /// Used to insert this thread into the process' `ready_threads` list.
     ///
     /// INVARIANT: May never be used for any other list than the `self.process.ready_threads`.
@@ -482,7 +456,7 @@ kernel::list::impl_list_item! {
 
 impl Thread {
     pub(crate) fn new(id: i32, process: Arc<Process>) -> Result<Arc<Self>> {
-        let inner = InnerThread::new(process.task.pid())?;
+        let inner = InnerThread::new()?;
 
         let prio = ThreadPrioState {
             state: PriorityState::Set,
@@ -496,7 +470,7 @@ impl Thread {
                 task: ARef::from(&**kernel::current!()),
                 inner <- kernel::new_spinlock!(inner, "Thread::inner"),
                 prio_lock <- kernel::new_spinlock!(prio, "Thread::prio_lock"),
-                work_condvar <- kernel::new_condvar!("Thread::work_condvar"),
+                work_condvar <- kernel::new_poll_condvar!("Thread::work_condvar"),
                 links <- ListLinks::new(),
                 links_track <- AtomicTracker::new(),
             }),
@@ -505,12 +479,7 @@ impl Thread {
     }
 
     #[inline(never)]
-    pub(crate) fn debug_print(
-        self: &Arc<Self>,
-        m: &SeqFile,
-        print_all: bool,
-        hashed: bool,
-    ) -> Result {
+    pub(crate) fn debug_print(self: &Arc<Self>, m: &SeqFile, print_all: bool) -> Result<()> {
         let inner = self.inner.lock();
 
         if print_all || inner.current_transaction.is_some() || !inner.work_list.is_empty() {
@@ -523,11 +492,11 @@ impl Thread {
             );
         }
 
-        let mut t_opt = inner.current_transaction.as_ref();
+        let mut t_opt = inner.current_transaction.clone();
         while let Some(t) = t_opt {
             if Arc::ptr_eq(&t.from, self) {
                 t.debug_print_inner(m, "    outgoing transaction ");
-                t_opt = t.from_parent.as_ref();
+                t_opt = t.from_parent.clone();
             } else if Arc::ptr_eq(&t.to, &self.process) {
                 t.debug_print_inner(m, "    incoming transaction ");
                 t_opt = t.find_from(self);
@@ -538,21 +507,14 @@ impl Thread {
         }
 
         for work in &inner.work_list {
-            work.debug_print(m, "    ", "    pending transaction ", hashed)?;
+            work.debug_print(m, "    ", "    pending transaction ")?;
         }
         Ok(())
     }
 
-    pub(crate) fn clear_extended_error(&self, debug_id: usize) {
-        self.inner.lock().extended_error = ExtendedError::new(debug_id as u32, BR_OK, 0);
-    }
-
     pub(crate) fn get_extended_error(&self, data: UserSlice) -> Result {
         let mut writer = data.writer();
-        let mut inner = self.inner.lock();
-        let ee = inner.extended_error;
-        inner.extended_error = ExtendedError::new(0, BR_OK, 0);
-        drop(inner);
+        let ee = self.inner.lock().extended_error;
         writer.write(&ee)?;
         Ok(())
     }
@@ -568,9 +530,6 @@ impl Thread {
     /// Attempts to fetch a work item from the thread-local queue. The behaviour if the queue is
     /// empty depends on `wait`: if it is true, the function waits for some work to be queued (or a
     /// signal); otherwise it returns indicating that none is available.
-    // #[export_name] is a temporary workaround so that ps output does not become unreadable from
-    // mangled symbol names.
-    #[export_name = "rust_binder_waitlcl"]
     fn get_work_local(self: &Arc<Self>, wait: bool) -> Result<Option<DLArc<dyn DeliverToRead>>> {
         {
             let mut inner = self.inner.lock();
@@ -609,25 +568,10 @@ impl Thread {
     ///
     /// This must only be called when the thread is not participating in a transaction chain. If it
     /// is, the local version (`get_work_local`) should be used instead.
-    // #[export_name] is a temporary workaround so that ps output does not become unreadable from
-    // mangled symbol names.
-    #[export_name = "rust_binder_wait"]
     fn get_work(self: &Arc<Self>, wait: bool) -> Result<Option<DLArc<dyn DeliverToRead>>> {
-        let thread_has_deferred_work;
-
         // Try to get work from the thread's work queue, using only a local lock.
         {
             let mut inner = self.inner.lock();
-
-            // The process_work_list boolean is used to make us go to sleep even if there is work
-            // in the thread todo-list, but it doesn't apply to the process todo-list. Furthermore,
-            // work in the thread todo-list must still be delivered before the process list.
-            //
-            // Thus, in some scenarios we must return the thread work now even if we were requested
-            // to wait. Adjust `process_work_list` to `true` accordingly.
-            inner.process_work_list |= inner.looper_need_return;
-            inner.process_work_list |= !wait;
-
             if let Some(work) = inner.pop_work() {
                 return Ok(Some(work));
             }
@@ -635,28 +579,18 @@ impl Thread {
                 drop(inner);
                 return Ok(self.process.get_work());
             }
-
-            // Note that if the thread list is empty, then the call to `pop_work()` has changed
-            // `process_work_list` back to `false` even if we set it to `true` above.
-            thread_has_deferred_work = !inner.work_list.is_empty();
         }
-
-        self.restore_priority(&self.process.default_priority);
 
         // If the caller doesn't want to wait, try to grab work from the process queue.
         //
         // We know nothing will have been queued directly to the thread queue because it is not in
-        // a transaction and it is not in the process' ready list. We also know the thread list has
-        // no deferred work due to the `inner.process_work_list |= !wait` call above.
+        // a transaction and it is not in the process' ready list.
         if !wait {
             return self.process.get_work().ok_or(EAGAIN).map(Some);
         }
 
         // Get work from the process queue. If none is available, atomically register as ready.
-        let reg = match self
-            .process
-            .get_work_or_register(self, thread_has_deferred_work)
-        {
+        let reg = match self.process.get_work_or_register(self) {
             Either::Left(work) => return Ok(Some(work)),
             Either::Right(reg) => reg,
         };
@@ -667,23 +601,21 @@ impl Thread {
                 return Ok(Some(work));
             }
 
+            self.restore_priority(&self.process.default_priority);
+
             inner.looper_flags |= LOOPER_WAITING | LOOPER_WAITING_PROC;
             let signal_pending = self.work_condvar.wait_interruptible_freezable(&mut inner);
             inner.looper_flags &= !(LOOPER_WAITING | LOOPER_WAITING_PROC);
 
             if signal_pending || inner.looper_need_return {
-                // We need to return now.
-                //
-                // We need to pull the thread off the list of ready threads (by dropping `reg`),
-                // then check the state again after it's off the list to ensure that something was
-                // not queued in the meantime. If something has been queued (or if there is
-                // deferred work), we just return it (instead of the error).
+                // We need to return now. We need to pull the thread off the list of ready threads
+                // (by dropping `reg`), then check the state again after it's off the list to
+                // ensure that something was not queued in the meantime. If something has been
+                // queued, we just return it (instead of the error).
                 drop(inner);
                 drop(reg);
 
-                inner = self.inner.lock();
-                inner.process_work_list = true;
-                let res = match inner.pop_work() {
+                let res = match self.inner.lock().pop_work() {
                     Some(work) => Ok(Some(work)),
                     None if signal_pending => Err(EINTR),
                     None => Ok(None),
@@ -698,14 +630,7 @@ impl Thread {
     /// Returns whether the item was successfully pushed. This can only fail if the thread is dead.
     pub(crate) fn push_work(&self, work: DLArc<dyn DeliverToRead>) -> PushWorkRes {
         let sync = work.should_sync_wakeup();
-        self.push_work_inner(work, sync)
-    }
 
-    pub(crate) fn push_work_inner(
-        &self,
-        work: DLArc<dyn DeliverToRead>,
-        sync: bool,
-    ) -> PushWorkRes {
         let res = self.inner.lock().push_work(work);
 
         if res.is_ok() {
@@ -724,12 +649,7 @@ impl Thread {
     pub(crate) fn push_work_if_looper(&self, work: DLArc<dyn DeliverToRead>) -> BinderResult {
         let mut inner = self.inner.lock();
         if inner.is_looper() && !inner.is_dead {
-            // Not notifying work_condvar: Reply to current thread.
-            let res = inner.push_work(work);
-            drop(inner);
-            if matches!(res, PushWorkRes::OkNotifyPoll) {
-                self.process.notify_poll(false);
-            }
+            inner.push_work(work);
             Ok(())
         } else {
             drop(inner);
@@ -742,17 +662,7 @@ impl Thread {
     }
 
     pub(crate) fn push_return_work(&self, reply: u32) {
-        // Not notifying work_condvar: Reply to current thread.
-        let res = self.inner.lock().push_return_work(reply);
-        if matches!(res, PushWorkRes::OkNotifyPoll) {
-            self.process.notify_poll(false);
-        }
-    }
-
-    pub(crate) fn pop_work_even_if_deferred(&self) -> Option<DLArc<dyn DeliverToRead>> {
-        let mut thread_inner = self.inner.lock();
-        thread_inner.process_work_list = true;
-        thread_inner.pop_work()
+        self.inner.lock().push_return_work(reply);
     }
 
     fn do_set_priority(&self, desired: &BinderPriority, verify: bool) {
@@ -843,8 +753,8 @@ impl Thread {
     }
 
     pub(crate) fn restore_priority(&self, desired: &BinderPriority) {
-        crate::trace::vh_restore_priority(&self.task);
         self.do_set_priority(desired, false);
+        crate::trace::vh_restore_priority(&self.task);
     }
 
     fn translate_object(
@@ -916,12 +826,11 @@ impl Thread {
                 let alloc_offset = match sg_state.unused_buffer_space.claim_next(obj_length) {
                     Ok(alloc_offset) => alloc_offset,
                     Err(err) => {
-                        binder_debug!(
-                            UserError,
-                            "failed to claim space for a BINDER_TYPE_PTR (offset: {}, limit: {}, size: {})",
+                        pr_warn!(
+                            "Failed to claim space for a BINDER_TYPE_PTR. (offset: {}, limit: {}, size: {})",
                             sg_state.unused_buffer_space.offset,
                             sg_state.unused_buffer_space.limit,
-                            obj_length
+                            obj_length,
                         );
                         return Err(err.into());
                     }
@@ -964,8 +873,8 @@ impl Thread {
                     let parent_entry = match sg_state.sg_entries.get_mut(info.parent_sg_index) {
                         Some(parent_entry) => parent_entry,
                         None => {
-                            pr_err_ratelimited!(
-                                "validate_parent_fixup returned index out of bounds for sg.entries\n"
+                            pr_err!(
+                                "validate_parent_fixup returned index out of bounds for sg.entries"
                             );
                             return Err(EINVAL.into());
                         }
@@ -973,7 +882,8 @@ impl Thread {
 
                     parent_entry.fixup_min_offset = info.new_min_offset;
                     parent_entry.pointer_fixups.push(
-                        PointerFixupEntry::Fixup {
+                        PointerFixupEntry {
+                            skip: 0,
                             pointer_value: buffer_ptr_in_user_space,
                             target_offset: info.target_offset,
                         },
@@ -999,11 +909,6 @@ impl Thread {
                 let num_fds = usize::try_from(obj.num_fds).map_err(|_| EINVAL)?;
                 let fds_len = num_fds.checked_mul(size_of::<u32>()).ok_or(EINVAL)?;
 
-                if !is_aligned(parent_offset, size_of::<u32>()) {
-                    binder_debug!(UserError, "FDA parent offset not aligned correctly");
-                    return Err(EINVAL.into());
-                }
-
                 let info = sg_state.validate_parent_fixup(parent_index, parent_offset, fds_len)?;
                 view.alloc.info_add_fd_reserve(num_fds)?;
 
@@ -1011,24 +916,20 @@ impl Thread {
                 let parent_entry = match sg_state.sg_entries.get_mut(info.parent_sg_index) {
                     Some(parent_entry) => parent_entry,
                     None => {
-                        pr_err_ratelimited!(
-                            "validate_parent_fixup returned index out of bounds for sg.entries\n"
+                        pr_err!(
+                            "validate_parent_fixup returned index out of bounds for sg.entries"
                         );
                         return Err(EINVAL.into());
                     }
                 };
 
-                if !is_aligned(parent_entry.sender_uaddr, size_of::<u32>()) {
-                    binder_debug!(UserError, "FDA parent buffer not aligned correctly");
-                    return Err(EINVAL.into());
-                }
-
                 parent_entry.fixup_min_offset = info.new_min_offset;
                 parent_entry
                     .pointer_fixups
                     .push(
-                        PointerFixupEntry::Skip {
+                        PointerFixupEntry {
                             skip: fds_len,
+                            pointer_value: 0,
                             target_offset: info.target_offset,
                         },
                         GFP_KERNEL,
@@ -1039,14 +940,11 @@ impl Thread {
                     .sender_uaddr
                     .checked_add(parent_offset)
                     .ok_or(EINVAL)?;
-
                 let mut fda_bytes = KVec::new();
                 UserSlice::new(fda_uaddr as _, fds_len).read_all(&mut fda_bytes, GFP_KERNEL)?;
 
                 if fds_len != fda_bytes.len() {
-                    pr_err_ratelimited!(
-                        "UserSlice::read_all returned wrong length in BINDER_TYPE_FDA\n"
-                    );
+                    pr_err!("UserSlice::read_all returned wrong length in BINDER_TYPE_FDA");
                     return Err(EINVAL.into());
                 }
 
@@ -1091,43 +989,39 @@ impl Thread {
 
             let mut reader = UserSlice::new(sg_entry.sender_uaddr as _, sg_entry.length).reader();
             for fixup in &mut sg_entry.pointer_fixups {
-                let (fixup_len, fixup_offset) = match fixup {
-                    PointerFixupEntry::Fixup { target_offset, .. } => {
-                        (size_of::<u64>(), *target_offset)
-                    }
-                    PointerFixupEntry::Skip {
-                        skip,
-                        target_offset,
-                    } => (*skip, *target_offset),
+                let fixup_len = if fixup.skip == 0 {
+                    size_of::<u64>()
+                } else {
+                    fixup.skip
                 };
 
-                let target_offset_end = fixup_offset.checked_add(fixup_len).ok_or(EINVAL)?;
-                if fixup_offset < end_of_previous_fixup || offset_end < target_offset_end {
-                    binder_debug!(
-                        UserError,
-                        "fixups oob {fixup_offset} {end_of_previous_fixup} {offset_end} {target_offset_end}"
+                let target_offset_end = fixup.target_offset.checked_add(fixup_len).ok_or(EINVAL)?;
+                if fixup.target_offset < end_of_previous_fixup || offset_end < target_offset_end {
+                    pr_warn!(
+                        "Fixups oob {} {} {} {}",
+                        fixup.target_offset,
+                        end_of_previous_fixup,
+                        offset_end,
+                        target_offset_end
                     );
                     return Err(EINVAL.into());
                 }
 
                 let copy_off = end_of_previous_fixup;
-                let copy_len = fixup_offset - end_of_previous_fixup;
+                let copy_len = fixup.target_offset - end_of_previous_fixup;
                 if let Err(err) = alloc.copy_into(&mut reader, copy_off, copy_len) {
-                    binder_debug!(UserError, "failed copying into alloc: {err:?}");
+                    pr_warn!("Failed copying into alloc: {:?}", err);
                     return Err(err.into());
                 }
-                if let PointerFixupEntry::Fixup { pointer_value, .. } = fixup {
-                    let res = alloc.write::<u64>(fixup_offset, pointer_value);
+                if fixup.skip == 0 {
+                    let res = alloc.write::<u64>(fixup.target_offset, &fixup.pointer_value);
                     if let Err(err) = res {
-                        binder_debug!(UserError, "failed copying ptr into alloc: {err:?}");
+                        pr_warn!("Failed copying ptr into alloc: {:?}", err);
                         return Err(err.into());
                     }
                 }
                 if let Err(err) = reader.skip(fixup_len) {
-                    binder_debug!(
-                        UserError,
-                        "failed skipping {fixup_len} from reader: {err:?}"
-                    );
+                    pr_warn!("Failed skipping {} from reader: {:?}", fixup_len, err);
                     return Err(err.into());
                 }
                 end_of_previous_fixup = target_offset_end;
@@ -1135,7 +1029,7 @@ impl Thread {
             let copy_off = end_of_previous_fixup;
             let copy_len = offset_end - end_of_previous_fixup;
             if let Err(err) = alloc.copy_into(&mut reader, copy_off, copy_len) {
-                binder_debug!(UserError, "failed copying remainder into alloc: {err:?}");
+                pr_warn!("Failed copying remainder into alloc: {:?}", err);
                 return Err(err.into());
             }
         }
@@ -1150,21 +1044,19 @@ impl Thread {
     pub(crate) fn copy_transaction_data(
         &self,
         to_process: Arc<Process>,
-        info: &mut TransactionInfo,
+        tr: &BinderTransactionDataSg,
         debug_id: usize,
         allow_fds: bool,
         txn_security_ctx_offset: Option<&mut usize>,
     ) -> BinderResult<NewAllocation> {
+        let trd = &tr.transaction_data;
+        let is_oneway = trd.flags & TF_ONE_WAY != 0;
         let mut secctx = if let Some(offset) = txn_security_ctx_offset {
             let secid = self.process.cred.get_secid();
             let ctx = match security::SecurityCtx::from_secid(secid) {
                 Ok(ctx) => ctx,
                 Err(err) => {
-                    pr_warn_ratelimited!(
-                        "Failed to get security ctx for id {}: {:?}\n",
-                        secid,
-                        err
-                    );
+                    pr_warn!("Failed to get security ctx for id {}: {:?}", secid, err);
                     return Err(err.into());
                 }
             };
@@ -1173,52 +1065,64 @@ impl Thread {
             None
         };
 
-        let data_size = info.data_size;
+        let data_size = trd.data_size.try_into().map_err(|_| EINVAL)?;
         let aligned_data_size = ptr_align(data_size).ok_or(EINVAL)?;
-        let offsets_size = info.offsets_size;
-        let buffers_size = info.buffers_size;
+        let offsets_size = trd.offsets_size.try_into().map_err(|_| EINVAL)?;
+        let aligned_offsets_size = ptr_align(offsets_size).ok_or(EINVAL)?;
+        let buffers_size = tr.buffers_size.try_into().map_err(|_| EINVAL)?;
+        let aligned_buffers_size = ptr_align(buffers_size).ok_or(EINVAL)?;
         let aligned_secctx_size = match secctx.as_ref() {
             Some((_offset, ctx)) => ptr_align(ctx.len()).ok_or(EINVAL)?,
             None => 0,
         };
 
-        if !is_aligned(offsets_size, size_of::<u64>()) {
-            return Err(EINVAL.into());
-        }
-        if !is_aligned(buffers_size, size_of::<u64>()) {
-            return Err(EINVAL.into());
-        }
-
         // This guarantees that at least `sizeof(usize)` bytes will be allocated.
         let len = usize::max(
             aligned_data_size
-                .checked_add(offsets_size)
-                .and_then(|sum| sum.checked_add(buffers_size))
+                .checked_add(aligned_offsets_size)
+                .and_then(|sum| sum.checked_add(aligned_buffers_size))
                 .and_then(|sum| sum.checked_add(aligned_secctx_size))
                 .ok_or(ENOMEM)?,
-            size_of::<u64>(),
+            size_of::<usize>(),
         );
-        let secctx_off = aligned_data_size + offsets_size + buffers_size;
-        let mut alloc = to_process.buffer_alloc(debug_id, len, info)?;
+        let secctx_off = aligned_data_size + aligned_offsets_size + aligned_buffers_size;
+        let mut alloc =
+            match to_process.buffer_alloc(debug_id, len, is_oneway, self.process.task.pid()) {
+                Ok(alloc) => alloc,
+                Err(err) => {
+                    pr_warn!(
+                        "Failed to allocate buffer. len:{}, is_oneway:{}",
+                        len,
+                        is_oneway
+                    );
+                    return Err(err);
+                }
+            };
 
-        crate::trace::trace_transaction_alloc_buf(debug_id, data_size, offsets_size, buffers_size);
+        crate::trace::trace_transaction_alloc_buf(debug_id, tr);
 
-        let mut buffer_reader = UserSlice::new(info.data_ptr, data_size).reader();
+        // SAFETY: This accesses a union field, but it's okay because the field's type is valid for
+        // all bit-patterns.
+        let trd_data_ptr = unsafe { &trd.data.ptr };
+        let mut buffer_reader = UserSlice::new(trd_data_ptr.buffer as _, data_size).reader();
         let mut end_of_previous_object = 0;
         let mut sg_state = None;
 
         // Copy offsets if there are any.
         if offsets_size > 0 {
-            let mut offsets_reader = UserSlice::new(info.offsets_ptr, offsets_size).reader();
+            {
+                let mut reader = UserSlice::new(trd_data_ptr.offsets as _, offsets_size).reader();
+                alloc.copy_into(&mut reader, aligned_data_size, offsets_size)?;
+            }
 
             let offsets_start = aligned_data_size;
-            let offsets_end = aligned_data_size + offsets_size;
+            let offsets_end = aligned_data_size + aligned_offsets_size;
 
             // This state is used for BINDER_TYPE_PTR objects.
             let sg_state = sg_state.insert(ScatterGatherState {
                 unused_buffer_space: UnusedBufferSpace {
                     offset: offsets_end,
-                    limit: offsets_end + buffers_size,
+                    limit: len,
                 },
                 sg_entries: KVec::new(),
                 ancestors: KVec::new(),
@@ -1227,15 +1131,13 @@ impl Thread {
             // Traverse the objects specified.
             let mut view = AllocationView::new(&mut alloc, data_size);
             for (index, index_offset) in (offsets_start..offsets_end)
-                .step_by(size_of::<u64>())
+                .step_by(size_of::<usize>())
                 .enumerate()
             {
-                let offset = offsets_reader.read::<u64>()?;
-                view.alloc.write(index_offset, &offset)?;
-                let offset: usize = offset.try_into().map_err(|_| EINVAL)?;
+                let offset = view.alloc.read(index_offset)?;
 
-                if offset < end_of_previous_object || !is_aligned(offset, size_of::<u32>()) {
-                    binder_debug!(UserError, "got transaction with invalid offset");
+                if offset < end_of_previous_object {
+                    pr_warn!("Got transaction with invalid offset.");
                     return Err(EINVAL.into());
                 }
 
@@ -1260,13 +1162,13 @@ impl Thread {
                 ) {
                     Ok(()) => end_of_previous_object = offset + object.size(),
                     Err(err) => {
-                        binder_debug!(UserError, "error while translating object: {err:?}");
+                        pr_warn!("Error while translating object.");
                         return Err(err);
                     }
                 }
 
                 // Update the indexes containing objects to clean up.
-                let offset_after_object = index_offset + size_of::<u64>();
+                let offset_after_object = index_offset + size_of::<usize>();
                 view.alloc
                     .set_info_offsets(offsets_start..offset_after_object);
             }
@@ -1280,12 +1182,15 @@ impl Thread {
         )?;
 
         if let Some(sg_state) = sg_state.as_mut() {
-            self.apply_sg(&mut alloc, sg_state)?;
+            if let Err(err) = self.apply_sg(&mut alloc, sg_state) {
+                pr_warn!("Failure in apply_sg: {:?}", err);
+                return Err(err);
+            }
         }
 
         if let Some((off_out, secctx)) = secctx.as_mut() {
             if let Err(err) = alloc.write(secctx_off, secctx.as_bytes()) {
-                binder_debug!(UserError, "failed to write security context: {err:?}");
+                pr_warn!("Failed to write security context: {:?}", err);
                 return Err(err.into());
             }
             **off_out = secctx_off;
@@ -1299,17 +1204,8 @@ impl Thread {
             let mut inner = thread.inner.lock();
             inner.pop_transaction_to_reply(thread.as_ref())
         } {
-            binder_debug!(
-                DeadTransaction,
-                "release transaction {} in, still active",
-                transaction.debug_id
-            );
-
             let reply = Err(BR_DEAD_REPLY);
-            if !transaction
-                .from
-                .deliver_single_reply(reply, &transaction, None)
-            {
+            if !transaction.from.deliver_single_reply(reply, &transaction) {
                 break;
             }
 
@@ -1321,9 +1217,8 @@ impl Thread {
         &self,
         reply: Result<DLArc<Transaction>, u32>,
         transaction: &DArc<Transaction>,
-        extended_error: Option<ExtendedError>,
     ) {
-        if self.deliver_single_reply(reply, transaction, extended_error) {
+        if self.deliver_single_reply(reply, transaction) {
             transaction.from.unwind_transaction_stack();
         }
     }
@@ -1337,15 +1232,14 @@ impl Thread {
         &self,
         reply: Result<DLArc<Transaction>, u32>,
         transaction: &DArc<Transaction>,
-        extended_error: Option<ExtendedError>,
     ) -> bool {
         if let Ok(transaction) = &reply {
-            crate::trace::trace_transaction(true, &transaction, Some(&self.task));
+            crate::trace::trace_transaction(true, &transaction);
 
             transaction.set_outstanding(&mut self.process.inner.lock());
         }
 
-        let ret = {
+        {
             let mut inner = self.inner.lock();
             if !inner.pop_transaction_replied(transaction) {
                 return false;
@@ -1355,23 +1249,16 @@ impl Thread {
                 return true;
             }
 
-            if let Some(ee) = extended_error {
-                if inner.extended_error.command == BR_OK {
-                    inner.extended_error = ee;
-                }
-            }
-
             match reply {
-                Ok(work) => inner.push_work(work),
+                Ok(work) => {
+                    inner.push_work(work);
+                }
                 Err(code) => inner.push_reply_work(code),
             }
-        };
+        }
 
         // Notify the thread now that we've released the inner lock.
         self.work_condvar.notify_sync();
-        if matches!(ret, PushWorkRes::OkNotifyPoll) {
-            self.process.notify_poll(true);
-        }
         false
     }
 
@@ -1391,7 +1278,7 @@ impl Thread {
         let inner = self.inner.lock();
         if let Some(cur) = &inner.current_transaction {
             if core::ptr::eq(self, cur.from.as_ref()) {
-                pr_warn_ratelimited!("got new transaction with bad transaction stack\n");
+                pr_warn!("got new transaction with bad transaction stack");
                 return Err(EINVAL);
             }
             Ok(Some(cur.clone()))
@@ -1400,137 +1287,43 @@ impl Thread {
         }
     }
 
-    // No inlining avoids allocating stack space for `BinderTransactionData` for the entire
-    // duration of `transaction()`.
-    #[inline(never)]
-    fn read_transaction_info(
-        &self,
-        cmd: u32,
-        reader: &mut UserSliceReader,
-        info: &mut TransactionInfo,
-    ) -> Result<()> {
-        let td = match cmd {
-            BC_TRANSACTION | BC_REPLY => {
-                reader.read::<BinderTransactionData>()?.with_buffers_size(0)
-            }
-            BC_TRANSACTION_SG | BC_REPLY_SG => reader.read::<BinderTransactionDataSg>()?,
-            _ => return Err(EINVAL),
-        };
-
-        // SAFETY: Above `read` call initializes all bytes, so this union read is ok.
-        let trd_data_ptr = unsafe { &td.transaction_data.data.ptr };
-
-        info.is_reply = matches!(cmd, BC_REPLY | BC_REPLY_SG);
-        info.from_pid = self.process.task.pid();
-        info.from_tid = self.id;
-        info.code = td.transaction_data.code;
-        info.flags = td.transaction_data.flags;
-        info.data_ptr = trd_data_ptr.buffer as usize;
-        info.data_size = td.transaction_data.data_size as usize;
-        info.offsets_ptr = trd_data_ptr.offsets as usize;
-        info.offsets_size = td.transaction_data.offsets_size as usize;
-        info.buffers_size = td.buffers_size as usize;
-        // SAFETY: Above `read` call initializes all bytes, so this union read is ok.
-        info.target_handle = unsafe { td.transaction_data.target.handle };
-
-        info.debug_id = super::next_debug_id();
-
-        Ok(())
-    }
-
-    #[inline(never)]
-    fn transaction(self: &Arc<Self>, cmd: u32, reader: &mut UserSliceReader) -> Result<()> {
-        // SAFETY: All zeros valid for this type.
-        let mut info = unsafe { core::mem::zeroed::<TransactionInfo>() };
-        self.read_transaction_info(cmd, reader, &mut info)?;
-
-        self.clear_extended_error(info.debug_id);
-
-        let ret = if info.is_reply {
-            self.reply_inner(&mut info)
-        } else if info.is_oneway() {
-            self.oneway_transaction_inner(&mut info)
-        } else {
-            self.transaction_inner(&mut info)
-        };
-
-        // This runs when return work is passed to the caller. This is not
-        // always the same as the transaction failing, as reply errors are
-        // delivered to the remote process.
-        if let Err(err) = ret {
-            self.push_return_work(err.reply);
-            if err.reply != BR_TRANSACTION_COMPLETE {
-                info.reply = err.reply;
-                info.error_line = Some(err.line);
-                if let Some(source) = err.source {
-                    info.errno = Some(source);
-
-                    self.inner.lock().extended_error =
-                        ExtendedError::new(info.debug_id as u32, err.reply, source.to_errno());
-                }
-            }
-        }
-
-        info.write_log(&self.process.ctx);
-
-        if info.oneway_spam_suspect {
-            // If this is both a oneway spam suspect and a failure, we report it twice. This is
-            // useful in case the transaction failed with BR_TRANSACTION_PENDING_FROZEN.
-            info.report_netlink(BR_ONEWAY_SPAM_SUSPECT, &self.process.ctx);
-        }
-        // This runs when the transaction failed.
-        if info.reply != 0 {
-            info.report_netlink(info.reply, &self.process.ctx);
-            if let Some(errno) = info.errno {
-                let error_line: &dyn core::fmt::Display = match &info.error_line {
-                    Some(line) => line,
-                    None => &0,
-                };
-                binder_debug!(
-                    FailedTransaction,
-                    "transaction {} to {}:{} failed {:?}, code {} size {}-{} line {}",
-                    if info.is_reply {
-                        "reply"
-                    } else if info.is_oneway() {
-                        "async"
-                    } else {
-                        "call"
-                    },
-                    info.to_pid,
-                    info.to_tid,
-                    errno,
-                    info.code,
-                    info.data_size,
-                    info.offsets_size,
-                    error_line
+    fn transaction<T>(self: &Arc<Self>, tr: &BinderTransactionDataSg, inner: T)
+    where
+        T: FnOnce(&Arc<Self>, &BinderTransactionDataSg) -> BinderResult,
+    {
+        if let Err(err) = inner(self, tr) {
+            if err.should_pr_warn() {
+                let mut ee = self.inner.lock().extended_error;
+                ee.command = err.reply;
+                ee.param = err.as_errno();
+                pr_warn!(
+                    "Transaction failed: {:?} my_pid:{}",
+                    err,
+                    self.process.pid_in_current_ns()
                 );
             }
-        }
 
-        Ok(())
+            self.push_return_work(err.reply);
+        }
     }
 
-    fn transaction_inner(self: &Arc<Self>, info: &mut TransactionInfo) -> BinderResult {
-        let node_ref = self.process.get_transaction_node(info.target_handle)?;
-        info.to_pid = node_ref.node.owner.task.pid();
-        info.to_node_debug_id = node_ref.node.debug_id;
+    fn transaction_inner(self: &Arc<Self>, tr: &BinderTransactionDataSg) -> BinderResult {
+        let handle = unsafe { tr.transaction_data.target.handle };
+        let node_ref = self.process.get_transaction_node(handle)?;
         security::binder_transaction(&self.process.cred, &node_ref.node.owner.cred)?;
         // TODO: We need to ensure that there isn't a pending transaction in the work queue. How
         // could this happen?
         let top = self.top_of_transaction_stack()?;
-        let list_completion = DTRWrap::arc_try_new(DeliverCode::new(
-            BR_TRANSACTION_COMPLETE,
-            self.process.task.pid(),
-        ))?;
+        let list_completion = DTRWrap::arc_try_new(DeliverCode::new(BR_TRANSACTION_COMPLETE))?;
         let completion = list_completion.clone_arc();
-        let transaction = Transaction::new(node_ref, top, self, info)?;
+        let transaction = Transaction::new(node_ref, top, self, tr)?;
 
         // Check that the transaction stack hasn't changed while the lock was released, then update
         // it with the new transaction.
         {
             let mut inner = self.inner.lock();
             if !transaction.is_stacked_on(&inner.current_transaction) {
-                binder_debug!(UserError, "got new transaction with bad transaction stack");
+                pr_warn!("Transaction stack changed during transaction!");
                 return Err(EINVAL.into());
             }
             inner.current_transaction = Some(transaction.clone_arc());
@@ -1539,7 +1332,7 @@ impl Thread {
             inner.push_work_deferred(list_completion);
         }
 
-        if let Err(e) = transaction.submit(info) {
+        if let Err(e) = transaction.submit() {
             completion.skip();
             // Define `transaction` first to drop it after `inner`.
             let transaction;
@@ -1552,122 +1345,64 @@ impl Thread {
         }
     }
 
-    fn reply_inner(self: &Arc<Self>, info: &mut TransactionInfo) -> BinderResult {
-        let orig = match self.inner.lock().pop_transaction_to_reply(self) {
-            Ok(orig) => orig,
-            Err(err) => {
-                binder_debug!(UserError, "got reply transaction with no transaction stack");
-                return Err(err.into());
-            }
-        };
+    fn reply_inner(self: &Arc<Self>, tr: &BinderTransactionDataSg) -> BinderResult {
+        let orig = self.inner.lock().pop_transaction_to_reply(self)?;
         if !orig.from.is_current_transaction(&orig) {
-            binder_debug!(
-                UserError,
-                "got reply transaction with bad transaction stack"
-            );
             return Err(EINVAL.into());
         }
 
-        info.to_tid = orig.from.id;
-        info.to_pid = orig.from.process.task.pid();
-
         // We need to complete the transaction even if we cannot complete building the reply.
         let out = (|| -> BinderResult<_> {
-            let completion = DTRWrap::arc_try_new(DeliverCode::new(
-                BR_TRANSACTION_COMPLETE,
-                self.process.task.pid(),
-            ))?;
+            let completion = DTRWrap::arc_try_new(DeliverCode::new(BR_TRANSACTION_COMPLETE))?;
             let process = orig.from.process.clone();
             let allow_fds = orig.flags & TF_ACCEPT_FDS != 0;
-            let reply = Transaction::new_reply(self, process, info, allow_fds)?;
-            if info.flags & TF_DEFER_COMPLETE != 0 {
-                // The flag is set. Perform a deferred push so that `read` can wait for the
-                // next incoming transaction without a userspace roundtrip.
-                self.inner.lock().push_work_deferred(completion);
-            } else {
-                // Not notifying work_condvar: Reply to current thread.
-                let res = self.inner.lock().push_work(completion);
-                if matches!(res, PushWorkRes::OkNotifyPoll) {
-                    self.process.notify_poll(false);
-                }
-            }
-            orig.from.deliver_reply(Ok(reply), &orig, None);
+            let reply = Transaction::new_reply(self, process, tr, allow_fds)?;
+            self.inner.lock().push_work(completion);
+            orig.from.deliver_reply(Ok(reply), &orig);
             Ok(())
         })()
         .map_err(|mut err| {
             // At this point we only return `BR_TRANSACTION_COMPLETE` to the caller, and we must let
             // the sender know that the transaction has completed (with an error in this case).
-
-            let param = err.source.as_ref().map_or(0, |e| e.to_errno());
-            let ee = ExtendedError::new(info.debug_id as u32, err.reply, param);
-            orig.from
-                .deliver_reply(Err(BR_FAILED_REPLY), &orig, Some(ee));
-            info.reply = BR_FAILED_REPLY;
-            info.errno = err.source;
-            info.error_line = Some(err.line);
+            pr_warn!(
+                "Failure {:?} during reply - delivering BR_FAILED_REPLY to sender.",
+                err
+            );
+            let reply = Err(BR_FAILED_REPLY);
+            orig.from.deliver_reply(reply, &orig);
             err.reply = BR_TRANSACTION_COMPLETE;
             err
         });
 
         // Restore the priority even on failure.
-        if orig.from_parent.is_some() {
-            let mut prio_state = self.prio_lock.lock();
-            prio_state.state = PriorityState::Pending;
-            prio_state.next = orig.saved_priority();
-        }
         self.restore_priority(&orig.saved_priority());
         out
     }
 
-    fn oneway_transaction_inner(self: &Arc<Self>, info: &mut TransactionInfo) -> BinderResult {
-        let node_ref = self.process.get_transaction_node(info.target_handle)?;
-        info.to_pid = node_ref.node.owner.task.pid();
-        info.to_node_debug_id = node_ref.node.debug_id;
+    fn oneway_transaction_inner(self: &Arc<Self>, tr: &BinderTransactionDataSg) -> BinderResult {
+        // SAFETY: The `handle` field is valid for all possible byte values, so reading from the
+        // union is okay.
+        let handle = unsafe { tr.transaction_data.target.handle };
+        let node_ref = self.process.get_transaction_node(handle)?;
         security::binder_transaction(&self.process.cred, &node_ref.node.owner.cred)?;
-        let transaction = Transaction::new(node_ref, None, self, info)?;
-        let code = if self.process.is_oneway_spam_detection_enabled() && info.oneway_spam_suspect {
+        let transaction = Transaction::new(node_ref, None, self, tr)?;
+        let code = if self.process.is_oneway_spam_detection_enabled()
+            && transaction.oneway_spam_detected
+        {
             BR_ONEWAY_SPAM_SUSPECT
         } else {
             BR_TRANSACTION_COMPLETE
         };
-        let list_completion =
-            DTRWrap::arc_try_new(DeliverCode::new(code, self.process.task.pid()))?;
+        let list_completion = DTRWrap::arc_try_new(DeliverCode::new(code))?;
         let completion = list_completion.clone_arc();
-        // Not notifying work_condvar: Reply to current thread.
-        let res = self.inner.lock().push_work(list_completion);
-        match transaction.submit(info) {
-            Ok(()) => {
-                if matches!(res, PushWorkRes::OkNotifyPoll) {
-                    self.process.notify_poll(false);
-                }
-                Ok(())
-            }
+        self.inner.lock().push_work(list_completion);
+        match transaction.submit() {
+            Ok(()) => Ok(()),
             Err(err) => {
                 completion.skip();
                 Err(err)
             }
         }
-    }
-
-    fn enter_exit_looper(&self, cmd: u32) {
-        let mut inner;
-        match cmd {
-            BC_REGISTER_LOOPER => {
-                let valid = self.process.register_thread();
-                inner = self.inner.lock();
-                inner.looper_register(valid);
-            }
-            BC_ENTER_LOOPER => {
-                inner = self.inner.lock();
-                inner.looper_enter();
-            }
-            BC_EXIT_LOOPER => {
-                inner = self.inner.lock();
-                inner.looper_exit();
-            }
-            _ => unreachable!(),
-        }
-        crate::trace::vh_looper_entry(self, inner.looper_flags);
     }
 
     fn write(self: &Arc<Self>, req: &mut BinderWriteRead) -> Result {
@@ -1682,18 +1417,39 @@ impl Thread {
             GLOBAL_STATS.inc_bc(cmd);
             self.process.stats.inc_bc(cmd);
             match cmd {
-                BC_TRANSACTION | BC_TRANSACTION_SG | BC_REPLY | BC_REPLY_SG => {
-                    self.transaction(cmd, &mut reader)?;
+                BC_TRANSACTION => {
+                    let tr = reader.read::<BinderTransactionData>()?.with_buffers_size(0);
+                    if tr.transaction_data.flags & TF_ONE_WAY != 0 {
+                        self.transaction(&tr, Self::oneway_transaction_inner);
+                    } else {
+                        self.transaction(&tr, Self::transaction_inner);
+                    }
+                }
+                BC_TRANSACTION_SG => {
+                    let tr = reader.read::<BinderTransactionDataSg>()?;
+                    if tr.transaction_data.flags & TF_ONE_WAY != 0 {
+                        self.transaction(&tr, Self::oneway_transaction_inner);
+                    } else {
+                        self.transaction(&tr, Self::transaction_inner);
+                    }
+                }
+                BC_REPLY => {
+                    let tr = reader.read::<BinderTransactionData>()?.with_buffers_size(0);
+                    self.transaction(&tr, Self::reply_inner)
+                }
+                BC_REPLY_SG => {
+                    let tr = reader.read::<BinderTransactionDataSg>()?;
+                    self.transaction(&tr, Self::reply_inner)
                 }
                 BC_FREE_BUFFER => {
                     let buffer = self.process.buffer_get(reader.read()?);
-                    if let Some(buffer) = buffer {
+                    if let Some(buffer) = &buffer {
                         if buffer.looper_need_return_on_free() {
                             self.inner.lock().looper_need_return = true;
                         }
                         crate::trace::trace_transaction_buffer_release(buffer.debug_id);
-                        drop(buffer);
                     }
+                    drop(buffer);
                 }
                 BC_INCREFS => {
                     self.process
@@ -1720,9 +1476,12 @@ impl Thread {
                 BC_REQUEST_DEATH_NOTIFICATION => self.process.request_death(&mut reader, self)?,
                 BC_CLEAR_DEATH_NOTIFICATION => self.process.clear_death(&mut reader, self)?,
                 BC_DEAD_BINDER_DONE => self.process.dead_binder_done(reader.read()?, self),
-                BC_REGISTER_LOOPER | BC_ENTER_LOOPER | BC_EXIT_LOOPER => {
-                    self.enter_exit_looper(cmd)
+                BC_REGISTER_LOOPER => {
+                    let valid = self.process.register_thread();
+                    self.inner.lock().looper_register(valid);
                 }
+                BC_ENTER_LOOPER => self.inner.lock().looper_enter(),
+                BC_EXIT_LOOPER => self.inner.lock().looper_exit(),
                 BC_REQUEST_FREEZE_NOTIFICATION => self.process.request_freeze_notif(&mut reader)?,
                 BC_CLEAR_FREEZE_NOTIFICATION => self.process.clear_freeze_notif(&mut reader)?,
                 BC_FREEZE_NOTIFICATION_DONE => self.process.freeze_notif_done(&mut reader)?,
@@ -1768,7 +1527,7 @@ impl Thread {
         let mut has_noop_placeholder = false;
         if req.read_consumed == 0 {
             if let Err(err) = writer.write_code(BR_NOOP) {
-                pr_warn_ratelimited!("Failure when writing BR_NOOP at beginning of buffer.\n");
+                pr_warn!("Failure when writing BR_NOOP at beginning of buffer.");
                 return Err(err);
             }
             has_noop_placeholder = true;
@@ -1791,7 +1550,7 @@ impl Thread {
                 Err(err) => {
                     // Propagate the error if we haven't written anything else.
                     if err != EINTR && err != EAGAIN {
-                        pr_warn_ratelimited!("Failure in work getter: {:?}\n", err);
+                        pr_warn!("Failure in work getter: {:?}", err);
                     }
                     if initial_len == writer.len() {
                         return Err(err);
@@ -1822,8 +1581,8 @@ impl Thread {
             ret = self.write(&mut req);
             crate::trace::trace_write_done(ret);
             if let Err(err) = ret {
-                pr_warn_ratelimited!(
-                    "Write failure {:?} in pid:{}\n",
+                pr_warn!(
+                    "Write failure {:?} in pid:{}",
                     err,
                     self.process.pid_in_current_ns()
                 );
@@ -1839,8 +1598,8 @@ impl Thread {
             ret = self.read(&mut req, wait);
             crate::trace::trace_read_done(ret);
             if ret.is_err() && ret != Err(EINTR) {
-                pr_warn_ratelimited!(
-                    "Read failure {:?} in pid:{}\n",
+                pr_warn!(
+                    "Read failure {:?} in pid:{}",
                     ret,
                     self.process.pid_in_current_ns()
                 );
@@ -1855,9 +1614,10 @@ impl Thread {
         ret
     }
 
-    pub(crate) fn poll(&self) -> Result<(bool, u32)> {
+    pub(crate) fn poll(&self, file: &File, table: PollTable<'_>) -> (bool, u32) {
+        table.register_wait(file, &self.work_condvar);
         let mut inner = self.inner.lock();
-        Ok((inner.should_use_process_work_queue(), inner.poll()))
+        (inner.should_use_process_work_queue(), inner.poll())
     }
 
     /// Make the call to `get_work` or `get_work_local` return immediately, if any.
@@ -1874,36 +1634,45 @@ impl Thread {
         }
     }
 
+    pub(crate) fn notify_if_poll_ready(&self, sync: bool) {
+        // Determine if we need to notify. This requires the lock.
+        let inner = self.inner.lock();
+        let notify = inner.looper_flags & LOOPER_POLL != 0 && inner.should_use_process_work_queue();
+        drop(inner);
+
+        // Now that the lock is no longer held, notify the waiters if we have to.
+        if notify {
+            if sync {
+                self.work_condvar.notify_sync();
+            } else {
+                self.work_condvar.notify_one();
+            }
+        }
+    }
+
     pub(crate) fn release(self: &Arc<Self>) {
-        {
-            let mut inner = self.inner.lock();
-            inner.is_dead = true;
-            inner.looper_flags |= LOOPER_EXITED;
-            crate::trace::vh_looper_entry(self, inner.looper_flags);
+        self.inner.lock().is_dead = true;
+
+        // Cancel all pending work items.
+        while let Ok(Some(work)) = self.get_work_local(false) {
+            work.into_arc().cancel();
         }
 
         self.unwind_transaction_stack();
-
-        // Cancel all pending work items.
-        while let Some(work) = self.pop_work_even_if_deferred() {
-            work.into_arc().cancel();
-        }
     }
 }
 
 #[pin_data]
 struct ThreadError {
     error_code: AtomicU32,
-    pid: i32,
     #[pin]
     links_track: AtomicTracker,
 }
 
 impl ThreadError {
-    fn try_new(pid: i32) -> Result<DArc<Self>> {
+    fn try_new() -> Result<DArc<Self>> {
         DTRWrap::arc_pin_init(pin_init!(Self {
             error_code: AtomicU32::new(BR_OK),
-            pid,
             links_track <- AtomicTracker::new(),
         }))
         .map(ListArc::into_arc)
@@ -1930,23 +1699,14 @@ impl DeliverToRead for ThreadError {
         Ok(true)
     }
 
-    fn cancel(self: DArc<Self>) {
-        let code = self.error_code.load(Ordering::Relaxed);
-        if code != BR_OK {
-            binder_debug!(
-                pid = self.pid,
-                DeadTransaction,
-                "undelivered TRANSACTION_ERROR: {code}"
-            );
-        }
-    }
+    fn cancel(self: DArc<Self>) {}
     fn on_thread_selected(&self, _thread: &Thread) {}
 
     fn should_sync_wakeup(&self) -> bool {
         false
     }
 
-    fn debug_print(&self, m: &SeqFile, prefix: &str, _tprefix: &str, _hashed: bool) -> Result {
+    fn debug_print(&self, m: &SeqFile, prefix: &str, _tprefix: &str) -> Result<()> {
         seq_print!(
             m,
             "{}transaction error: {}\n",

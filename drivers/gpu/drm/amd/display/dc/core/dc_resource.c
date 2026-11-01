@@ -164,13 +164,7 @@ enum dce_version resource_parse_asic_id(struct hw_asic_id asic_id)
 
 	case FAMILY_NV:
 		dc_version = DCN_VERSION_2_0;
-		if (asic_id.chip_id == DEVICE_ID_NV_13FE ||
-		    asic_id.chip_id == DEVICE_ID_NV_143F ||
-		    asic_id.chip_id == DEVICE_ID_NV_13F9 ||
-		    asic_id.chip_id == DEVICE_ID_NV_13FA ||
-		    asic_id.chip_id == DEVICE_ID_NV_13FB ||
-		    asic_id.chip_id == DEVICE_ID_NV_13FC ||
-		    asic_id.chip_id == DEVICE_ID_NV_13DB) {
+		if (asic_id.chip_id == DEVICE_ID_NV_13FE || asic_id.chip_id == DEVICE_ID_NV_143F) {
 			dc_version = DCN_VERSION_2_01;
 			break;
 		}
@@ -4156,13 +4150,7 @@ static void set_avi_info_frame(
 	unsigned int fr_ind = pipe_ctx->stream->timing.fr_index;
 	enum dc_timing_3d_format format;
 
-	if (stream->avi_infopacket.valid) {
-		*info_packet = stream->avi_infopacket;
-		return;
-	}
-
 	memset(&hdmi_info, 0, sizeof(union hdmi_info_packet));
-
 
 	color_space = pipe_ctx->stream->output_color_space;
 	if (color_space == COLOR_SPACE_UNKNOWN)
@@ -4693,7 +4681,7 @@ void resource_build_bit_depth_reduction_params(struct dc_stream_state *stream,
 			option = DITHER_OPTION_SPATIAL8;
 			break;
 		case COLOR_DEPTH_101010:
-			option = DITHER_OPTION_SPATIAL10;
+			option = DITHER_OPTION_TRUN10;
 			break;
 		default:
 			option = DITHER_OPTION_DISABLE;

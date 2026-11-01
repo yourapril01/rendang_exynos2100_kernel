@@ -264,8 +264,9 @@ static int sun8i_ce_cipher_prepare(struct crypto_engine *engine, void *async_req
 		goto theend_sgs;
 	}
 
-	rctx->nr_sgs = ns;
-	rctx->nr_sgd = nd;
+	chan->timeout = areq->cryptlen;
+	rctx->nr_sgs = nr_sgs;
+	rctx->nr_sgd = nr_sgd;
 	return 0;
 
 theend_sgs:

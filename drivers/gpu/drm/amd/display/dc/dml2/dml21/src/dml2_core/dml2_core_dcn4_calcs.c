@@ -1262,27 +1262,18 @@ static void CalculateDETBufferSize(
 
 static double CalculateRequiredDispclk(
 	enum dml2_odm_mode ODMMode,
-	double PixelClock,
-	bool isTMDS420)
+	double PixelClock)
 {
-	double DispClk;
 
 	if (ODMMode == dml2_odm_mode_combine_4to1) {
-		DispClk = PixelClock / 4.0;
+		return PixelClock / 4.0;
 	} else if (ODMMode == dml2_odm_mode_combine_3to1) {
-		DispClk = PixelClock / 3.0;
+		return PixelClock / 3.0;
 	} else if (ODMMode == dml2_odm_mode_combine_2to1) {
-		DispClk = PixelClock / 2.0;
+		return PixelClock / 2.0;
 	} else {
-		DispClk = PixelClock;
+		return PixelClock;
 	}
-
-	if (isTMDS420) {
-		double TMDS420MinPixClock = PixelClock / 2.0;
-		DispClk = math_max2(DispClk, TMDS420MinPixClock);
-	}
-
-	return DispClk;
 }
 
 static double TruncToValidBPP(
@@ -2774,7 +2765,7 @@ static double dml_get_return_bandwidth_available(
 	return return_bw_mbps;
 }
 
-static noinline_for_stack void calculate_bandwidth_available(
+static void calculate_bandwidth_available(
 	double avg_bandwidth_available_min[dml2_core_internal_soc_state_max],
 	double avg_bandwidth_available[dml2_core_internal_soc_state_max][dml2_core_internal_bw_max],
 	double urg_bandwidth_available_min[dml2_core_internal_soc_state_max], // min between SDP and DRAM
@@ -4066,7 +4057,7 @@ static bool ValidateODMMode(enum dml2_odm_mode ODMMode,
 	return true;
 }
 
-static noinline_for_stack void CalculateODMMode(
+static void CalculateODMMode(
 	unsigned int MaximumPixelsPerLinePerDSCUnit,
 	unsigned int HActive,
 	enum dml2_output_format_class OutFormat,
@@ -4097,12 +4088,11 @@ static noinline_for_stack void CalculateODMMode(
 	bool success;
 	bool UseDSC = DSCEnable && (NumberOfDSCSlices > 0);
 	enum dml2_odm_mode DecidedODMMode;
-	bool isTMDS420 = (OutFormat == dml2_420 && Output == dml2_hdmi);
 
-	SurfaceRequiredDISPCLKWithoutODMCombine = CalculateRequiredDispclk(dml2_odm_mode_bypass, PixelClock, isTMDS420);
-	SurfaceRequiredDISPCLKWithODMCombineTwoToOne = CalculateRequiredDispclk(dml2_odm_mode_combine_2to1, PixelClock, isTMDS420);
-	SurfaceRequiredDISPCLKWithODMCombineThreeToOne = CalculateRequiredDispclk(dml2_odm_mode_combine_3to1, PixelClock, isTMDS420);
-	SurfaceRequiredDISPCLKWithODMCombineFourToOne = CalculateRequiredDispclk(dml2_odm_mode_combine_4to1, PixelClock, isTMDS420);
+	SurfaceRequiredDISPCLKWithoutODMCombine = CalculateRequiredDispclk(dml2_odm_mode_bypass, PixelClock);
+	SurfaceRequiredDISPCLKWithODMCombineTwoToOne = CalculateRequiredDispclk(dml2_odm_mode_combine_2to1, PixelClock);
+	SurfaceRequiredDISPCLKWithODMCombineThreeToOne = CalculateRequiredDispclk(dml2_odm_mode_combine_3to1, PixelClock);
+	SurfaceRequiredDISPCLKWithODMCombineFourToOne = CalculateRequiredDispclk(dml2_odm_mode_combine_4to1, PixelClock);
 #ifdef __DML_VBA_DEBUG__
 	dml2_printf("DML::%s: ODMUse = %d\n", __func__, ODMUse);
 	dml2_printf("DML::%s: Output = %d\n", __func__, Output);
@@ -4164,7 +4154,7 @@ static noinline_for_stack void CalculateODMMode(
 #endif
 }
 
-static noinline_for_stack void CalculateOutputLink(
+static void CalculateOutputLink(
 	struct dml2_core_internal_scratch *s,
 	double PHYCLK,
 	double PHYCLKD18,
@@ -6731,7 +6721,7 @@ static void calculate_bytes_to_fetch_required_to_hide_latency(
 	}
 }
 
-static noinline_for_stack void calculate_vactive_det_fill_latency(
+static void calculate_vactive_det_fill_latency(
 		const struct dml2_display_cfg *display_cfg,
 		unsigned int num_active_planes,
 		unsigned int bytes_required_l[],

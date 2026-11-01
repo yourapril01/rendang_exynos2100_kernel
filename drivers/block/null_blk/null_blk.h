@@ -107,7 +107,6 @@ struct nullb_device {
 	bool shared_tags; /* share tag set between devices for blk-mq */
 	bool shared_tag_bitmap; /* use hostwide shared tags */
 	bool fua; /* Support FUA */
-	bool preserves_write_order;
 };
 
 struct nullb {

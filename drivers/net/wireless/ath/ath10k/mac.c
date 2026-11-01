@@ -3,19 +3,17 @@
  * Copyright (c) 2005-2011 Atheros Communications Inc.
  * Copyright (c) 2011-2017 Qualcomm Atheros, Inc.
  * Copyright (c) 2018-2019, The Linux Foundation. All rights reserved.
- * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+ * Copyright (c) 2021-2024 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #include "mac.h"
 
-#include <linux/export.h>
 #include <net/cfg80211.h>
 #include <net/mac80211.h>
 #include <linux/etherdevice.h>
 #include <linux/acpi.h>
 #include <linux/of.h>
 #include <linux/bitfield.h>
-#include <linux/random.h>
 
 #include "hif.h"
 #include "core.h"
@@ -290,15 +288,8 @@ static int ath10k_send_key(struct ath10k_vif *arvif,
 		key->flags |= IEEE80211_KEY_FLAG_GENERATE_IV;
 
 	if (cmd == DISABLE_KEY) {
-		if (flags & WMI_KEY_GROUP) {
-			/* Not all hardware handles group-key deletion operation
-			 * correctly. Replace the key with a junk value to invalidate it.
-			 */
-			get_random_bytes(key->key, key->keylen);
-		} else {
-			arg.key_cipher = ar->wmi_key_cipher[WMI_CIPHER_NONE];
-			arg.key_data = NULL;
-		}
+		arg.key_cipher = ar->wmi_key_cipher[WMI_CIPHER_NONE];
+		arg.key_data = NULL;
 	}
 
 	return ath10k_wmi_vdev_install_key(arvif->ar, &arg);
@@ -1029,26 +1020,6 @@ static inline int ath10k_vdev_setup_sync(struct ath10k *ar)
 		return -ETIMEDOUT;
 
 	return ar->last_wmi_vdev_start_status;
-}
-
-static inline int ath10k_vdev_delete_sync(struct ath10k *ar)
-{
-	unsigned long time_left;
-
-	lockdep_assert_held(&ar->conf_mutex);
-
-	if (!test_bit(WMI_SERVICE_SYNC_DELETE_CMDS, ar->wmi.svc_map))
-		return 0;
-
-	if (test_bit(ATH10K_FLAG_CRASH_FLUSH, &ar->dev_flags))
-		return -ESHUTDOWN;
-
-	time_left = wait_for_completion_timeout(&ar->vdev_delete_done,
-						ATH10K_VDEV_DELETE_TIMEOUT_HZ);
-	if (time_left == 0)
-		return -ETIMEDOUT;
-
-	return 0;
 }
 
 static int ath10k_monitor_vdev_start(struct ath10k *ar, int vdev_id)
@@ -5425,7 +5396,6 @@ static void ath10k_stop(struct ieee80211_hw *hw, bool suspend)
 	cancel_work_sync(&ar->set_coverage_class_work);
 	cancel_delayed_work_sync(&ar->scan.timeout);
 	cancel_work_sync(&ar->restart_work);
-	cancel_work_sync(&ar->recovery_check_work);
 }
 
 static int ath10k_config_ps(struct ath10k *ar)
@@ -5930,6 +5900,7 @@ static void ath10k_remove_interface(struct ieee80211_hw *hw,
 	struct ath10k *ar = hw->priv;
 	struct ath10k_vif *arvif = (void *)vif->drv_priv;
 	struct ath10k_peer *peer;
+	unsigned long time_left;
 	int ret;
 	int i;
 
@@ -5969,10 +5940,13 @@ static void ath10k_remove_interface(struct ieee80211_hw *hw,
 		ath10k_warn(ar, "failed to delete WMI vdev %i: %d\n",
 			    arvif->vdev_id, ret);
 
-	ret = ath10k_vdev_delete_sync(ar);
-	if (ret) {
-		ath10k_warn(ar, "Error in receiving vdev delete response: %d\n", ret);
-		goto out;
+	if (test_bit(WMI_SERVICE_SYNC_DELETE_CMDS, ar->wmi.svc_map)) {
+		time_left = wait_for_completion_timeout(&ar->vdev_delete_done,
+							ATH10K_VDEV_DELETE_TIMEOUT_HZ);
+		if (time_left == 0) {
+			ath10k_warn(ar, "Timeout in receiving vdev delete response\n");
+			goto out;
+		}
 	}
 
 	/* Some firmware revisions don't notify host about self-peer removal
@@ -8151,12 +8125,7 @@ static void ath10k_reconfig_complete(struct ieee80211_hw *hw,
 		ath10k_info(ar, "device successfully recovered\n");
 		ar->state = ATH10K_STATE_ON;
 		ieee80211_wake_queues(ar->hw);
-
-		/* Clear recovery state. */
-		complete(&ar->driver_recovery);
-		atomic_set(&ar->fail_cont_count, 0);
-		atomic_set(&ar->pending_recovery, 0);
-
+		clear_bit(ATH10K_FLAG_RESTARTING, &ar->dev_flags);
 		if (ar->hw_params.hw_restart_disconnect) {
 			list_for_each_entry(arvif, &ar->arvifs, list) {
 				if (arvif->is_up && arvif->vdev_type == WMI_VDEV_TYPE_STA)

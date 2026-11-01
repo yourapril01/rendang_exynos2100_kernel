@@ -213,7 +213,7 @@ static void wacom_handle_model_response(struct wacom *wacom)
 		case 0x3731: /* PL-710 */
 			wacom->res_x = 2540;
 			wacom->res_y = 2540;
-			fallthrough;
+			/* fall through */
 		case 0x3535: /* PL-550 */
 		case 0x3830: /* PL-800 */
 			wacom->extra_z_bits = 2;
@@ -521,7 +521,7 @@ static int wacom_connect(struct serio *serio, struct serio_driver *drv)
 	struct input_dev *input_dev;
 	int err = -ENOMEM;
 
-	wacom = kzalloc(sizeof(*wacom), GFP_KERNEL);
+	wacom = kzalloc(sizeof(struct wacom), GFP_KERNEL);
 	input_dev = input_allocate_device();
 	if (!wacom || !input_dev)
 		goto free_device;

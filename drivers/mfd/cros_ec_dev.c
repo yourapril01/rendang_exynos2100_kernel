@@ -87,6 +87,7 @@ static const struct mfd_cell cros_ec_sensorhub_cells[] = {
 };
 
 static const struct mfd_cell cros_usbpd_charger_cells[] = {
+	{ .name = "cros-charge-control", },
 	{ .name = "cros-usbpd-charger", },
 	{ .name = "cros-usbpd-logger", },
 };
@@ -109,10 +110,6 @@ static const struct mfd_cell cros_ec_keyboard_leds_cells[] = {
 
 static const struct mfd_cell cros_ec_ucsi_cells[] = {
 	{ .name = "cros_ec_ucsi", },
-};
-
-static const struct mfd_cell cros_ec_charge_control_cells[] = {
-	{ .name = "cros-charge-control", },
 };
 
 static const struct cros_feature_to_cells cros_subdevices[] = {
@@ -150,11 +147,6 @@ static const struct cros_feature_to_cells cros_subdevices[] = {
 		.id		= EC_FEATURE_PWM_KEYB,
 		.mfd_cells	= cros_ec_keyboard_leds_cells,
 		.num_cells	= ARRAY_SIZE(cros_ec_keyboard_leds_cells),
-	},
-	{
-		.id		= EC_FEATURE_CHARGER,
-		.mfd_cells	= cros_ec_charge_control_cells,
-		.num_cells	= ARRAY_SIZE(cros_ec_charge_control_cells),
 	},
 };
 
@@ -195,23 +187,13 @@ static int ec_device_probe(struct platform_device *pdev)
 	if (!ec)
 		return retval;
 
+	dev_set_drvdata(dev, ec);
 	ec->ec_dev = dev_get_drvdata(dev->parent);
 	ec->dev = dev;
 	ec->cmd_offset = ec_platform->cmd_offset;
 	ec->features.flags[0] = -1U; /* Not cached yet */
 	ec->features.flags[1] = -1U; /* Not cached yet */
 	device_initialize(&ec->class_dev);
-
-	/*
-	 * Add the class device
-	 */
-	ec->class_dev.class = &cros_class;
-	ec->class_dev.parent = dev;
-	ec->class_dev.release = cros_ec_class_release;
-
-	retval = cros_ec_read_features(ec);
-	if (retval < 0)
-		goto failed;
 
 	for (i = 0; i < ARRAY_SIZE(cros_mcu_devices); i++) {
 		/*
@@ -230,6 +212,13 @@ static int ec_device_probe(struct platform_device *pdev)
 		}
 	}
 
+	/*
+	 * Add the class device
+	 */
+	ec->class_dev.class = &cros_class;
+	ec->class_dev.parent = dev;
+	ec->class_dev.release = cros_ec_class_release;
+
 	retval = dev_set_name(&ec->class_dev, "%s", ec_platform->ec_name);
 	if (retval) {
 		dev_err(dev, "dev_set_name failed => %d\n", retval);
@@ -239,8 +228,6 @@ static int ec_device_probe(struct platform_device *pdev)
 	retval = device_add(&ec->class_dev);
 	if (retval)
 		goto failed;
-
-	dev_set_drvdata(dev, ec);
 
 	/* check whether this EC is a sensor hub. */
 	if (cros_ec_get_sensor_count(ec) > 0) {

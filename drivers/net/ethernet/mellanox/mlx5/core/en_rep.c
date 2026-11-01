@@ -1497,20 +1497,12 @@ static const struct mlx5e_profile mlx5e_uplink_rep_profile = {
 static int
 mlx5e_vport_uplink_rep_load(struct mlx5_core_dev *dev, struct mlx5_eswitch_rep *rep)
 {
+	struct mlx5e_priv *priv = netdev_priv(mlx5_uplink_netdev_get(dev));
 	struct mlx5e_rep_priv *rpriv = mlx5e_rep_to_rep_priv(rep);
-	struct net_device *netdev;
-	int err;
 
-	netdev = mlx5_uplink_netdev_get(dev);
-	if (!netdev)
-		return 0;
-
-	/* must not use netdev_priv(netdev), it might not be initialized yet */
-	rpriv->netdev = netdev;
-	err = mlx5e_netdev_change_profile(netdev, dev,
-					  &mlx5e_uplink_rep_profile, rpriv);
-	mlx5_uplink_netdev_put(dev, netdev);
-	return err;
+	rpriv->netdev = priv->netdev;
+	return mlx5e_netdev_change_profile(priv, &mlx5e_uplink_rep_profile,
+					   rpriv);
 }
 
 static void
@@ -1536,7 +1528,7 @@ mlx5e_vport_uplink_rep_unload(struct mlx5e_rep_priv *rpriv)
 	if (!(priv->mdev->priv.flags & MLX5_PRIV_FLAGS_SWITCH_LEGACY))
 		unregister_netdev(netdev);
 
-	mlx5e_netdev_attach_nic_profile(netdev, priv->mdev);
+	mlx5e_netdev_attach_nic_profile(priv);
 }
 
 static int
@@ -1602,7 +1594,7 @@ err_cleanup_profile:
 	priv->profile->cleanup(priv);
 
 err_destroy_netdev:
-	mlx5e_destroy_netdev(netdev);
+	mlx5e_destroy_netdev(netdev_priv(netdev));
 	return err;
 }
 
@@ -1637,16 +1629,8 @@ mlx5e_vport_rep_unload(struct mlx5_eswitch_rep *rep)
 {
 	struct mlx5e_rep_priv *rpriv = mlx5e_rep_to_rep_priv(rep);
 	struct net_device *netdev = rpriv->netdev;
-	struct mlx5e_priv *priv;
-	void *ppriv;
-
-	if (!netdev) {
-		ppriv = rpriv;
-		goto free_ppriv;
-	}
-
-	priv = netdev_priv(netdev);
-	ppriv = priv->ppriv;
+	struct mlx5e_priv *priv = netdev_priv(netdev);
+	void *ppriv = priv->ppriv;
 
 	if (rep->vport == MLX5_VPORT_UPLINK) {
 		mlx5e_vport_uplink_rep_unload(rpriv);
@@ -1657,7 +1641,7 @@ mlx5e_vport_rep_unload(struct mlx5_eswitch_rep *rep)
 	mlx5e_rep_vnic_reporter_destroy(priv);
 	mlx5e_detach_netdev(priv);
 	priv->profile->cleanup(priv);
-	mlx5e_destroy_netdev(netdev);
+	mlx5e_destroy_netdev(priv);
 free_ppriv:
 	kvfree(ppriv); /* mlx5e_rep_priv */
 }

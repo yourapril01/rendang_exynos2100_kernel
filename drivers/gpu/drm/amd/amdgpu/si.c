@@ -2022,9 +2022,9 @@ static uint32_t si_get_rev_id(struct amdgpu_device *adev)
 		>> CC_DRM_ID_STRAPS__ATI_REV_ID__SHIFT;
 }
 
-static int si_common_early_init(struct amdgpu_ip_block *ip_block)
+static int si_common_early_init(void *handle)
 {
-	struct amdgpu_device *adev = ip_block->adev;
+	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
 
 	adev->smc_rreg = &si_smc_rreg;
 	adev->smc_wreg = &si_smc_wreg;

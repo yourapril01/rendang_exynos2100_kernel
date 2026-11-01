@@ -9,7 +9,6 @@
 
 #include <linux/cpufreq.h>
 #include <linux/module.h>
-#include <trace/hooks/cpufreq.h>
 
 /*********************************************************************
  *                     FREQUENCY TABLE HELPERS                       *
@@ -41,7 +40,7 @@ int cpufreq_frequency_table_cpuinfo(struct cpufreq_policy *policy,
 	cpufreq_for_each_valid_entry(pos, table) {
 		freq = pos->frequency;
 
-		if ((!cpufreq_boost_enabled() || !policy->boost_enabled)
+		if (!cpufreq_boost_enabled()
 		    && (pos->flags & CPUFREQ_BOOST_FREQ))
 			continue;
 
@@ -53,13 +52,7 @@ int cpufreq_frequency_table_cpuinfo(struct cpufreq_policy *policy,
 	}
 
 	policy->min = policy->cpuinfo.min_freq = min_freq;
-	policy->max = max_freq;
-	/*
-	 * If the driver has set its own cpuinfo.max_freq above max_freq, leave
-	 * it as is.
-	 */
-	if (policy->cpuinfo.max_freq < max_freq)
-		policy->max = policy->cpuinfo.max_freq = max_freq;
+	policy->max = policy->cpuinfo.max_freq = max_freq;
 
 	if (policy->min == ~0)
 		return -EINVAL;
@@ -71,7 +64,7 @@ int cpufreq_frequency_table_verify(struct cpufreq_policy_data *policy,
 				   struct cpufreq_frequency_table *table)
 {
 	struct cpufreq_frequency_table *pos;
-	unsigned int freq, prev_smaller = 0;
+	unsigned int freq, next_larger = ~0;
 	bool found = false;
 
 	pr_debug("request for verification of policy (%u - %u kHz) for cpu %u\n",
@@ -87,12 +80,12 @@ int cpufreq_frequency_table_verify(struct cpufreq_policy_data *policy,
 			break;
 		}
 
-		if ((prev_smaller < freq) && (freq <= policy->max))
-			prev_smaller = freq;
+		if ((next_larger > freq) && (freq > policy->max))
+			next_larger = freq;
 	}
 
 	if (!found) {
-		policy->max = prev_smaller;
+		policy->max = next_larger;
 		cpufreq_verify_within_cpu_limits(policy);
 	}
 
@@ -195,7 +188,7 @@ int cpufreq_table_index_unsorted(struct cpufreq_policy *policy,
 	}
 	if (optimal.driver_data > i) {
 		if (suboptimal.driver_data > i) {
-			WARN(1, "Invalid frequency table: %u\n", policy->cpu);
+			WARN(1, "Invalid frequency table: %d\n", policy->cpu);
 			return 0;
 		}
 
@@ -228,7 +221,7 @@ int cpufreq_frequency_table_get_index(struct cpufreq_policy *policy,
 }
 EXPORT_SYMBOL_GPL(cpufreq_frequency_table_get_index);
 
-/*
+/**
  * show_available_freqs - show available frequencies for the specified CPU
  */
 static ssize_t show_available_freqs(struct cpufreq_policy *policy, char *buf,
@@ -255,7 +248,7 @@ static ssize_t show_available_freqs(struct cpufreq_policy *policy, char *buf,
 		if (show_boost ^ (pos->flags & CPUFREQ_BOOST_FREQ))
 			continue;
 
-		count += sprintf(&buf[count], "%u ", pos->frequency);
+		count += sprintf(&buf[count], "%d ", pos->frequency);
 	}
 	count += sprintf(&buf[count], "\n");
 
@@ -267,8 +260,8 @@ static ssize_t show_available_freqs(struct cpufreq_policy *policy, char *buf,
 struct freq_attr cpufreq_freq_attr_##_name##_freqs =     \
 __ATTR_RO(_name##_frequencies)
 
-/*
- * scaling_available_frequencies_show - show available normal frequencies for
+/**
+ * show_scaling_available_frequencies - show available normal frequencies for
  * the specified CPU
  */
 static ssize_t scaling_available_frequencies_show(struct cpufreq_policy *policy,
@@ -279,8 +272,8 @@ static ssize_t scaling_available_frequencies_show(struct cpufreq_policy *policy,
 cpufreq_attr_available_freq(scaling_available);
 EXPORT_SYMBOL_GPL(cpufreq_freq_attr_scaling_available_freqs);
 
-/*
- * scaling_boost_frequencies_show - show available boost frequencies for
+/**
+ * show_available_boost_freqs - show available boost frequencies for
  * the specified CPU
  */
 static ssize_t scaling_boost_frequencies_show(struct cpufreq_policy *policy,
@@ -356,13 +349,8 @@ int cpufreq_table_validate_and_sort(struct cpufreq_policy *policy)
 {
 	int ret;
 
-	if (!policy->freq_table) {
-		/* Freq table must be passed by drivers with target_index() */
-		if (has_target_index())
-			return -EINVAL;
-
+	if (!policy->freq_table)
 		return 0;
-	}
 
 	ret = cpufreq_frequency_table_cpuinfo(policy, policy->freq_table);
 	if (ret)
@@ -373,3 +361,4 @@ int cpufreq_table_validate_and_sort(struct cpufreq_policy *policy)
 
 MODULE_AUTHOR("Dominik Brodowski <linux@brodo.de>");
 MODULE_DESCRIPTION("CPUfreq frequency table helpers");
+MODULE_LICENSE("GPL");

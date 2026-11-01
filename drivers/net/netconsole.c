@@ -300,8 +300,6 @@ static void trim_newline(char *s, size_t maxlen)
 	size_t len;
 
 	len = strnlen(s, maxlen);
-	if (!len)
-		return;
 	if (s[len - 1] == '\n')
 		s[len - 1] = '\0';
 }
@@ -502,13 +500,6 @@ static ssize_t dev_name_store(struct config_item *item, const char *buf,
 		size_t count)
 {
 	struct netconsole_target *nt = to_target(item);
-	size_t len = count;
-
-	/* Account for a trailing newline appended by tools like echo */
-	if (len && buf[len - 1] == '\n')
-		len--;
-	if (len >= IFNAMSIZ)
-		return -ENAMETOOLONG;
 
 	mutex_lock(&dynamic_netconsole_mutex);
 	if (nt->enabled) {
@@ -659,7 +650,7 @@ static ssize_t remote_mac_store(struct config_item *item, const char *buf,
 
 	if (!mac_pton(buf, remote_mac))
 		goto out_unlock;
-	if (buf[MAC_ADDR_STR_LEN] && buf[MAC_ADDR_STR_LEN] != '\n')
+	if (buf[3 * ETH_ALEN - 1] && buf[3 * ETH_ALEN - 1] != '\n')
 		goto out_unlock;
 	memcpy(nt->np.remote_mac, remote_mac, ETH_ALEN);
 

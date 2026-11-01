@@ -21,8 +21,6 @@
  */
 
 #include "amdgpu_vm.h"
-#include "amdgpu.h"
-#include "amdgpu_reset.h"
 #include "amdgpu_object.h"
 #include "amdgpu_trace.h"
 
@@ -108,19 +106,11 @@ static int amdgpu_vm_cpu_update(struct amdgpu_vm_update_params *p,
 static int amdgpu_vm_cpu_commit(struct amdgpu_vm_update_params *p,
 				struct dma_fence **fence)
 {
-	struct amdgpu_device *adev = p->adev;
-
 	if (p->needs_flush)
 		atomic64_inc(&p->vm->tlb_seq);
 
 	mb();
-	/* A reset flushed the HDP anyway, so that here can be skipped when a reset is ongoing */
-	if (!down_read_trylock(&adev->reset_domain->sem))
-		return 0;
-
-	amdgpu_device_flush_hdp(adev, NULL);
-	up_read(&adev->reset_domain->sem);
-
+	amdgpu_device_flush_hdp(p->adev, NULL);
 	return 0;
 }
 

@@ -109,7 +109,7 @@ static int check_fsb(unsigned int fsbspeed)
 }
 
 static const struct x86_cpu_id powernow_k7_cpuids[] = {
-	X86_MATCH_VENDOR_FAM(AMD, 6, NULL),
+	{ X86_VENDOR_AMD, 6, },
 	{}
 };
 MODULE_DEVICE_TABLE(x86cpu, powernow_k7_cpuids);
@@ -644,7 +644,7 @@ static int powernow_cpu_init(struct cpufreq_policy *policy)
 	return 0;
 }
 
-static void powernow_cpu_exit(struct cpufreq_policy *policy)
+static int powernow_cpu_exit(struct cpufreq_policy *policy)
 {
 #ifdef CONFIG_X86_POWERNOW_K7_ACPI
 	if (acpi_processor_perf) {
@@ -655,6 +655,7 @@ static void powernow_cpu_exit(struct cpufreq_policy *policy)
 #endif
 
 	kfree(powernow_table);
+	return 0;
 }
 
 static struct cpufreq_driver powernow_driver = {

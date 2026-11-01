@@ -528,9 +528,9 @@ static void ih_v7_0_set_self_irq_funcs(struct amdgpu_device *adev)
 	adev->irq.self_irq.funcs = &ih_v7_0_self_irq_funcs;
 }
 
-static int ih_v7_0_early_init(struct amdgpu_ip_block *ip_block)
+static int ih_v7_0_early_init(void *handle)
 {
-	struct amdgpu_device *adev = ip_block->adev;
+	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
 
 	ih_v7_0_set_interrupt_funcs(adev);
 	ih_v7_0_set_self_irq_funcs(adev);

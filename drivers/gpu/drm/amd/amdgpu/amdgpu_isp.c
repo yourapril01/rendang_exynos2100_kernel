@@ -122,10 +122,9 @@ static int isp_load_fw_by_psp(struct amdgpu_device *adev)
 	return r;
 }
 
-static int isp_early_init(struct amdgpu_ip_block *ip_block)
+static int isp_early_init(void *handle)
 {
-
-	struct amdgpu_device *adev = ip_block->adev;
+	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
 	struct amdgpu_isp *isp = &adev->isp;
 
 	switch (amdgpu_ip_version(adev, ISP_HWIP, 0)) {

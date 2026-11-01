@@ -11,12 +11,15 @@
  * SpaceTec SpaceBall 2003/3003/4000 FLX driver for Linux
  */
 
+/*
+ */
+
 #include <linux/kernel.h>
 #include <linux/slab.h>
 #include <linux/module.h>
 #include <linux/input.h>
 #include <linux/serio.h>
-#include <linux/unaligned.h>
+#include <asm/unaligned.h>
 
 #define DRIVER_DESC	"SpaceTec SpaceBall 2003/3003/4000 FLX driver"
 
@@ -150,7 +153,7 @@ static irqreturn_t spaceball_interrupt(struct serio *serio,
 				break;
 			}
 			spaceball->escape = 0;
-			fallthrough;
+			/* fall through */
 		case 'M':
 		case 'Q':
 		case 'S':
@@ -158,7 +161,7 @@ static irqreturn_t spaceball_interrupt(struct serio *serio,
 				spaceball->escape = 0;
 				data &= 0x1f;
 			}
-			fallthrough;
+			/* fall through */
 		default:
 			if (spaceball->escape)
 				spaceball->escape = 0;
@@ -199,7 +202,7 @@ static int spaceball_connect(struct serio *serio, struct serio_driver *drv)
 	if ((id = serio->id.id) > SPACEBALL_MAX_ID)
 		return -ENODEV;
 
-	spaceball = kmalloc(sizeof(*spaceball), GFP_KERNEL);
+	spaceball = kmalloc(sizeof(struct spaceball), GFP_KERNEL);
 	input_dev = input_allocate_device();
 	if (!spaceball || !input_dev)
 		goto fail1;
@@ -224,13 +227,13 @@ static int spaceball_connect(struct serio *serio, struct serio_driver *drv)
 			input_dev->keybit[BIT_WORD(BTN_A)] |= BIT_MASK(BTN_A) |
 				BIT_MASK(BTN_B) | BIT_MASK(BTN_C) |
 				BIT_MASK(BTN_MODE);
-			fallthrough;
+			/* fall through */
 		default:
 			input_dev->keybit[BIT_WORD(BTN_0)] |= BIT_MASK(BTN_2) |
 				BIT_MASK(BTN_3) | BIT_MASK(BTN_4) |
 				BIT_MASK(BTN_5) | BIT_MASK(BTN_6) |
 				BIT_MASK(BTN_7) | BIT_MASK(BTN_8);
-			fallthrough;
+			/* fall through */
 		case SPACEBALL_3003C:
 			input_dev->keybit[BIT_WORD(BTN_0)] |= BIT_MASK(BTN_1) |
 				BIT_MASK(BTN_8);

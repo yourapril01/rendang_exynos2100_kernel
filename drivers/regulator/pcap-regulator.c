@@ -86,6 +86,10 @@ static const unsigned int SW1_table[] = {
 
 #define SW2_table SW1_table
 
+static const unsigned int SW3_table[] = {
+	4000000, 4500000, 5000000, 5500000,
+};
+
 struct pcap_regulator {
 	const u8 reg;
 	const u8 en;
@@ -105,7 +109,7 @@ struct pcap_regulator {
 		.lowpwr		= _lowpwr,				\
 	}
 
-static const struct pcap_regulator vreg_table[] = {
+static struct pcap_regulator vreg_table[] = {
 	VREG_INFO(V1,    PCAP_REG_VREG1,   1,  2,  18, 0),
 	VREG_INFO(V2,    PCAP_REG_VREG1,   5,  6,  19, 22),
 	VREG_INFO(V3,    PCAP_REG_VREG1,   7,  8,  20, 23),
@@ -141,7 +145,7 @@ static const struct pcap_regulator vreg_table[] = {
 static int pcap_regulator_set_voltage_sel(struct regulator_dev *rdev,
 					  unsigned selector)
 {
-	const struct pcap_regulator *vreg = &vreg_table[rdev_get_id(rdev)];
+	struct pcap_regulator *vreg = &vreg_table[rdev_get_id(rdev)];
 	void *pcap = rdev_get_drvdata(rdev);
 
 	/* the regulator doesn't support voltage switching */
@@ -155,7 +159,7 @@ static int pcap_regulator_set_voltage_sel(struct regulator_dev *rdev,
 
 static int pcap_regulator_get_voltage_sel(struct regulator_dev *rdev)
 {
-	const struct pcap_regulator *vreg = &vreg_table[rdev_get_id(rdev)];
+	struct pcap_regulator *vreg = &vreg_table[rdev_get_id(rdev)];
 	void *pcap = rdev_get_drvdata(rdev);
 	u32 tmp;
 
@@ -169,7 +173,7 @@ static int pcap_regulator_get_voltage_sel(struct regulator_dev *rdev)
 
 static int pcap_regulator_enable(struct regulator_dev *rdev)
 {
-	const struct pcap_regulator *vreg = &vreg_table[rdev_get_id(rdev)];
+	struct pcap_regulator *vreg = &vreg_table[rdev_get_id(rdev)];
 	void *pcap = rdev_get_drvdata(rdev);
 
 	if (vreg->en == NA)
@@ -180,7 +184,7 @@ static int pcap_regulator_enable(struct regulator_dev *rdev)
 
 static int pcap_regulator_disable(struct regulator_dev *rdev)
 {
-	const struct pcap_regulator *vreg = &vreg_table[rdev_get_id(rdev)];
+	struct pcap_regulator *vreg = &vreg_table[rdev_get_id(rdev)];
 	void *pcap = rdev_get_drvdata(rdev);
 
 	if (vreg->en == NA)
@@ -191,7 +195,7 @@ static int pcap_regulator_disable(struct regulator_dev *rdev)
 
 static int pcap_regulator_is_enabled(struct regulator_dev *rdev)
 {
-	const struct pcap_regulator *vreg = &vreg_table[rdev_get_id(rdev)];
+	struct pcap_regulator *vreg = &vreg_table[rdev_get_id(rdev)];
 	void *pcap = rdev_get_drvdata(rdev);
 	u32 tmp;
 
@@ -251,7 +255,6 @@ static int pcap_regulator_probe(struct platform_device *pdev)
 static struct platform_driver pcap_regulator_driver = {
 	.driver = {
 		.name	= "pcap-regulator",
-		.probe_type = PROBE_PREFER_ASYNCHRONOUS,
 	},
 	.probe	= pcap_regulator_probe,
 };

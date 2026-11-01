@@ -7,6 +7,9 @@
  *  Serial mouse driver for Linux
  */
 
+/*
+ */
+
 #include <linux/delay.h>
 #include <linux/module.h>
 #include <linux/slab.h>
@@ -125,7 +128,7 @@ static void sermouse_process_ms(struct sermouse *sermouse, signed char data)
 
 				case SERIO_MS:
 					sermouse->type = SERIO_MP;
-					fallthrough;
+					/* fall through */
 
 				case SERIO_MP:
 					if ((data >> 2) & 3) break;	/* M++ Wireless Extension packet. */
@@ -136,7 +139,7 @@ static void sermouse_process_ms(struct sermouse *sermouse, signed char data)
 				case SERIO_MZP:
 				case SERIO_MZPP:
 					input_report_key(dev, BTN_SIDE,   (data >> 5) & 1);
-					fallthrough;
+					/* fall through */
 
 				case SERIO_MZ:
 					input_report_key(dev, BTN_MIDDLE, (data >> 4) & 1);
@@ -231,7 +234,7 @@ static int sermouse_connect(struct serio *serio, struct serio_driver *drv)
 	unsigned char c = serio->id.extra;
 	int err = -ENOMEM;
 
-	sermouse = kzalloc(sizeof(*sermouse), GFP_KERNEL);
+	sermouse = kzalloc(sizeof(struct sermouse), GFP_KERNEL);
 	input_dev = input_allocate_device();
 	if (!sermouse || !input_dev)
 		goto fail1;

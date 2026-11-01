@@ -188,11 +188,11 @@ impl<T> RangeAllocator<T> {
                 self.reserve_new(args)
             }
             Impl::Array(array) => {
-                let (offset, oneway_spam_detected) =
+                let offset =
                     array.reserve_new(args.debug_id, args.size, args.is_oneway, args.pid)?;
                 Ok(ReserveNew::Success(ReserveNewSuccess {
                     offset,
-                    oneway_spam_detected,
+                    oneway_spam_detected: false,
                     _empty_array_alloc: args.empty_array_alloc,
                     _new_tree_alloc: args.new_tree_alloc,
                     _tree_alloc: args.tree_alloc,
@@ -239,10 +239,7 @@ impl<T> RangeAllocator<T> {
     }
 
     /// Called when an allocation is no longer in use by the kernel.
-    ///
-    /// The value in `data` will be stored, if any. A mutable reference is used to avoid dropping
-    /// the `T` when an error is returned.
-    pub(crate) fn reservation_commit(&mut self, offset: usize, data: &mut Option<T>) -> Result {
+    pub(crate) fn reservation_commit(&mut self, offset: usize, data: Option<T>) -> Result {
         match &mut self.inner {
             Impl::Empty(_size) => Err(EINVAL),
             Impl::Array(array) => array.reservation_commit(offset, data),

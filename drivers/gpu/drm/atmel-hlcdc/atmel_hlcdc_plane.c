@@ -78,6 +78,8 @@ drm_plane_state_to_atmel_hlcdc_plane_state(struct drm_plane_state *s)
 	return container_of(s, struct atmel_hlcdc_plane_state, base);
 }
 
+#define SUBPIXEL_MASK			0xffff
+
 static uint32_t rgb_formats[] = {
 	DRM_FORMAT_C8,
 	DRM_FORMAT_XRGB4444,
@@ -363,34 +365,13 @@ void atmel_xlcdc_plane_setup_scaler(struct atmel_hlcdc_plane *plane,
 				    xfactor);
 
 	/*
-	 * With YCbCr 4:2:0 window resampling, configuration register
-	 * LCDC_HEOCFG25.VXSCFACT and LCDC_HEOCFG27.HXSCFACT values are half
+	 * With YCbCr 4:2:2 and YCbYcr 4:2:0 window resampling, configuration
+	 * register LCDC_HEOCFG25.VXSCFACT and LCDC_HEOCFG27.HXSCFACT is half
 	 * the value of yfactor and xfactor.
-	 *
-	 * On the other hand, with YCbCr 4:2:2 window resampling, only the
-	 * configuration register LCDC_HEOCFG27.HXSCFACT value is half the value
-	 * of the xfactor; the value of LCDC_HEOCFG25.VXSCFACT is yfactor (no
-	 * division by 2).
 	 */
-	switch (state->base.fb->format->format) {
-	/* YCbCr 4:2:2 */
-	case DRM_FORMAT_YUYV:
-	case DRM_FORMAT_UYVY:
-	case DRM_FORMAT_YVYU:
-	case DRM_FORMAT_VYUY:
-	case DRM_FORMAT_YUV422:
-	case DRM_FORMAT_NV61:
-		xfactor /= 2;
-		break;
-
-	/* YCbCr 4:2:0 */
-	case DRM_FORMAT_YUV420:
-	case DRM_FORMAT_NV21:
+	if (state->base.fb->format->format == DRM_FORMAT_YUV420) {
 		yfactor /= 2;
 		xfactor /= 2;
-		break;
-	default:
-		break;
 	}
 
 	atmel_hlcdc_layer_write_cfg(&plane->layer, desc->layout.scaler_config + 2,
@@ -742,14 +723,23 @@ static int atmel_hlcdc_plane_atomic_check(struct drm_plane *p,
 	if (ret || !s->visible)
 		return ret;
 
-	hstate->src_x = s->src.x1 >> 16;
-	hstate->src_y = s->src.y1 >> 16;
-	hstate->src_w = drm_rect_width(&s->src) >> 16;
-	hstate->src_h = drm_rect_height(&s->src) >> 16;
+	hstate->src_x = s->src.x1;
+	hstate->src_y = s->src.y1;
+	hstate->src_w = drm_rect_width(&s->src);
+	hstate->src_h = drm_rect_height(&s->src);
 	hstate->crtc_x = s->dst.x1;
 	hstate->crtc_y = s->dst.y1;
 	hstate->crtc_w = drm_rect_width(&s->dst);
 	hstate->crtc_h = drm_rect_height(&s->dst);
+
+	if ((hstate->src_x | hstate->src_y | hstate->src_w | hstate->src_h) &
+	    SUBPIXEL_MASK)
+		return -EINVAL;
+
+	hstate->src_x >>= 16;
+	hstate->src_y >>= 16;
+	hstate->src_w >>= 16;
+	hstate->src_h >>= 16;
 
 	hstate->nplanes = fb->format->num_planes;
 	if (hstate->nplanes > ATMEL_HLCDC_LAYER_MAX_PLANES)
@@ -1174,7 +1164,8 @@ atmel_hlcdc_plane_atomic_duplicate_state(struct drm_plane *p)
 		return NULL;
 	}
 
-	__drm_atomic_helper_plane_duplicate_state(p, &copy->base);
+	if (copy->base.fb)
+		drm_framebuffer_get(copy->base.fb);
 
 	return &copy->base;
 }
@@ -1192,7 +1183,8 @@ static void atmel_hlcdc_plane_atomic_destroy_state(struct drm_plane *p,
 			      state->dscrs[i]->self);
 	}
 
-	__drm_atomic_helper_plane_destroy_state(s);
+	if (s->fb)
+		drm_framebuffer_put(s->fb);
 
 	kfree(state);
 }

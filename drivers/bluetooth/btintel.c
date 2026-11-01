@@ -245,13 +245,11 @@ void btintel_hw_error(struct hci_dev *hdev, u8 code)
 
 	bt_dev_err(hdev, "Hardware error 0x%2.2x", code);
 
-	hci_req_sync_lock(hdev);
-
 	skb = __hci_cmd_sync(hdev, HCI_OP_RESET, 0, NULL, HCI_INIT_TIMEOUT);
 	if (IS_ERR(skb)) {
 		bt_dev_err(hdev, "Reset after hardware error failed (%ld)",
 			   PTR_ERR(skb));
-		goto unlock;
+		return;
 	}
 	kfree_skb(skb);
 
@@ -259,21 +257,18 @@ void btintel_hw_error(struct hci_dev *hdev, u8 code)
 	if (IS_ERR(skb)) {
 		bt_dev_err(hdev, "Retrieving Intel exception info failed (%ld)",
 			   PTR_ERR(skb));
-		goto unlock;
+		return;
 	}
 
 	if (skb->len != 13) {
 		bt_dev_err(hdev, "Exception info size mismatch");
 		kfree_skb(skb);
-		goto unlock;
+		return;
 	}
 
 	bt_dev_err(hdev, "Exception info %s", (char *)(skb->data + 1));
 
 	kfree_skb(skb);
-
-unlock:
-	hci_req_sync_unlock(hdev);
 }
 EXPORT_SYMBOL_GPL(btintel_hw_error);
 
@@ -2661,7 +2656,7 @@ static u8 btintel_classify_pkt_type(struct hci_dev *hdev, struct sk_buff *skb)
 	 * Distinguish ISO data packets form ACL data packets
 	 * based on their connection handle value range.
 	 */
-	if (iso_capable(hdev) && hci_skb_pkt_type(skb) == HCI_ACLDATA_PKT) {
+	if (hci_skb_pkt_type(skb) == HCI_ACLDATA_PKT) {
 		__u16 handle = __le16_to_cpu(hci_acl_hdr(skb)->handle);
 
 		if (hci_handle(handle) >= BTINTEL_ISODATA_HANDLE_BASE)
@@ -2739,32 +2734,20 @@ static int btintel_set_dsbr(struct hci_dev *hdev, struct intel_version_tlv *ver)
 
 	struct btintel_dsbr_cmd cmd;
 	struct sk_buff *skb;
-	u32 dsbr, cnvi;
 	u8 status;
+	u32 dsbr;
+	bool apply_dsbr;
 	int err;
 
-	cnvi = ver->cnvi_top & 0xfff;
-	/* DSBR command needs to be sent for,
-	 * 1. BlazarI or BlazarIW + B0 step product in IML image.
-	 * 2. Gale Peak2 or BlazarU in OP image.
+	/* DSBR command needs to be sent for BlazarI + B0 step product after
+	 * downloading IML image.
 	 */
+	apply_dsbr = (ver->img_type == BTINTEL_IMG_IML &&
+		((ver->cnvi_top & 0xfff) == BTINTEL_CNVI_BLAZARI) &&
+		INTEL_CNVX_TOP_STEP(ver->cnvi_top) == 0x01);
 
-	switch (cnvi) {
-	case BTINTEL_CNVI_BLAZARI:
-	case BTINTEL_CNVI_BLAZARIW:
-		if (ver->img_type == BTINTEL_IMG_IML &&
-		    INTEL_CNVX_TOP_STEP(ver->cnvi_top) == 0x01)
-			break;
+	if (!apply_dsbr)
 		return 0;
-	case BTINTEL_CNVI_GAP:
-	case BTINTEL_CNVI_BLAZARU:
-		if (ver->img_type == BTINTEL_IMG_OP &&
-		    hdev->bus == HCI_USB)
-			break;
-		return 0;
-	default:
-		return 0;
-	}
 
 	dsbr = 0;
 	err = btintel_uefi_get_dsbr(&dsbr);

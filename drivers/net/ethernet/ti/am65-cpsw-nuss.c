@@ -290,7 +290,7 @@ static void am65_cpsw_nuss_ndo_slave_set_rx_mode(struct net_device *ndev)
 	cpsw_ale_set_allmulti(common->ale,
 			      ndev->flags & IFF_ALLMULTI, port->port_id);
 
-	port_mask = BIT(port->port_id) | ALE_PORT_HOST;
+	port_mask = ALE_PORT_HOST;
 	/* Clear all mcast from ALE */
 	cpsw_ale_flush_multicast(common->ale, port_mask, -1);
 
@@ -611,6 +611,8 @@ static struct sk_buff *am65_cpsw_build_skb(void *page_addr,
 					   unsigned int headroom)
 {
 	struct sk_buff *skb;
+
+	len += AM65_CPSW_HEADROOM;
 
 	skb = build_skb(page_addr, len);
 	if (unlikely(!skb))
@@ -1215,7 +1217,7 @@ static int am65_cpsw_nuss_rx_packets(struct am65_cpsw_rx_flow *flow,
 	}
 
 	skb = am65_cpsw_build_skb(page_addr, ndev,
-				  PAGE_SIZE, headroom);
+				  AM65_CPSW_MAX_PACKET_SIZE, headroom);
 	if (unlikely(!skb)) {
 		new_page = page;
 		goto requeue;

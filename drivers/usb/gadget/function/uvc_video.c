@@ -19,7 +19,6 @@
 #include "uvc.h"
 #include "uvc_queue.h"
 #include "uvc_video.h"
-#include "uvc_trace.h"
 
 /* --------------------------------------------------------------------------
  * Video codecs
@@ -272,8 +271,6 @@ static int uvcg_video_ep_queue(struct uvc_video *video, struct usb_request *req)
 
 	atomic_inc(&video->queued);
 
-	trace_uvcg_video_queue(req, atomic_read(&video->queued));
-
 	return ret;
 }
 
@@ -411,8 +408,6 @@ uvc_video_complete(struct usb_ep *ep, struct usb_request *req)
 	 */
 	queue_work(video->async_wq, &video->pump);
 
-	trace_uvcg_video_complete(req, atomic_read(&video->queued));
-
 	spin_unlock_irqrestore(&video->req_lock, flags);
 
 	kthread_queue_work(video->kworker, &video->hw_submit);
@@ -499,11 +494,13 @@ uvc_video_prep_requests(struct uvc_video *video)
 {
 	struct uvc_device *uvc = container_of(video, struct uvc_device, video);
 	struct usb_composite_dev *cdev = uvc->func.config->cdev;
-	unsigned int interval_duration;
+	unsigned int interval_duration = video->ep->desc->bInterval * 1250;
 	unsigned int max_req_size, req_size, header_size;
 	unsigned int nreq;
 
-	max_req_size = video->max_req_size;
+	max_req_size = video->ep->maxpacket
+		 * max_t(unsigned int, video->ep->maxburst, 1)
+		 * (video->ep->mult);
 
 	if (!usb_endpoint_xfer_isoc(video->ep->desc)) {
 		video->req_size = max_req_size;
@@ -513,11 +510,8 @@ uvc_video_prep_requests(struct uvc_video *video)
 		return;
 	}
 
-	interval_duration = 2 << (video->ep->desc->bInterval - 1);
 	if (cdev->gadget->speed < USB_SPEED_HIGH)
-		interval_duration *= 10000;
-	else
-		interval_duration *= 1250;
+		interval_duration = video->ep->desc->bInterval * 10000;
 
 	nreq = DIV_ROUND_UP(video->interval, interval_duration);
 
@@ -838,6 +832,7 @@ int uvcg_video_init(struct uvc_video *video, struct uvc_device *uvc)
 	video->interval = 666666;
 
 	/* Initialize the video buffers queue. */
-	return uvcg_queue_init(&video->queue, uvc->v4l2_dev.dev->parent,
+	uvcg_queue_init(&video->queue, uvc->v4l2_dev.dev->parent,
 			V4L2_BUF_TYPE_VIDEO_OUTPUT, &video->mutex);
+	return 0;
 }

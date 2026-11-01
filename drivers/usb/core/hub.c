@@ -35,14 +35,14 @@
 #include <linux/bitfield.h>
 #include <linux/uaccess.h>
 #include <asm/byteorder.h>
+#include <trace/hooks/usb.h>
 
 #include "hub.h"
 #include "phy.h"
 #include "otg_productlist.h"
-#include "trace.h"
 
-#include <linux/android_kabi.h>
-ANDROID_KABI_DECLONLY(trace_eval_map);
+#undef dev_dbg
+#define dev_dbg dev_err
 
 #define USB_VENDOR_GENESYS_LOGIC		0x05e3
 #define USB_VENDOR_SMSC				0x0424
@@ -70,12 +70,6 @@ ANDROID_KABI_DECLONLY(trace_eval_map);
  * USB_QUIRK_SHORT_SET_ADDRESS_REQ_TIMEOUT quirk flag is set.
  */
 #define USB_SHORT_SET_ADDRESS_REQ_TIMEOUT	500  /* ms */
-
-/*
- * Give SS hubs 200ms time after wake to train downstream links before
- * assuming no port activity and allowing hub to runtime suspend back.
- */
-#define USB_SS_PORT_U0_WAKE_TIME	200  /* ms */
 
 /* Protect struct usb_device->state and ->children members
  * Note: Both are also protected by ->dev.sem, except that ->state can
@@ -1104,7 +1098,6 @@ static void hub_activate(struct usb_hub *hub, enum hub_activation_type type)
 			goto init2;
 		goto init3;
 	}
-
 	hub_get(hub);
 
 	/* The superspeed hub except for root hub has to use Hub Depth
@@ -1353,17 +1346,6 @@ static void hub_activate(struct usb_hub *hub, enum hub_activation_type type)
 		device_unlock(&hdev->dev);
 	}
 
-	if (type == HUB_RESUME && hub_is_superspeed(hub->hdev)) {
-		/* give usb3 downstream links training time after hub resume */
-		usb_autopm_get_interface_no_resume(
-			to_usb_interface(hub->intfdev));
-
-		queue_delayed_work(system_power_efficient_wq,
-				   &hub->post_resume_work,
-				   msecs_to_jiffies(USB_SS_PORT_U0_WAKE_TIME));
-		return;
-	}
-
 	hub_put(hub);
 }
 
@@ -1380,14 +1362,6 @@ static void hub_init_func3(struct work_struct *ws)
 	struct usb_hub *hub = container_of(ws, struct usb_hub, init_work.work);
 
 	hub_activate(hub, HUB_INIT3);
-}
-
-static void hub_post_resume(struct work_struct *ws)
-{
-	struct usb_hub *hub = container_of(ws, struct usb_hub, post_resume_work.work);
-
-	usb_autopm_put_interface_async(to_usb_interface(hub->intfdev));
-	hub_put(hub);
 }
 
 enum hub_quiescing_type {
@@ -1415,7 +1389,6 @@ static void hub_quiesce(struct usb_hub *hub, enum hub_quiescing_type type)
 
 	/* Stop hub_wq and related activity */
 	del_timer_sync(&hub->irq_urb_retry);
-	flush_delayed_work(&hub->post_resume_work);
 	usb_kill_urb(hub->urb);
 	if (hub->has_indicators)
 		cancel_delayed_work_sync(&hub->leds);
@@ -1974,7 +1947,6 @@ static int hub_probe(struct usb_interface *intf, const struct usb_device_id *id)
 	hub->hdev = hdev;
 	INIT_DELAYED_WORK(&hub->leds, led_work);
 	INIT_DELAYED_WORK(&hub->init_work, NULL);
-	INIT_DELAYED_WORK(&hub->post_resume_work, hub_post_resume);
 	INIT_WORK(&hub->events, hub_event);
 	INIT_LIST_HEAD(&hub->onboard_devs);
 	spin_lock_init(&hub->irq_urb_lock);
@@ -2150,22 +2122,6 @@ static void update_port_device_state(struct usb_device *udev)
 	}
 }
 
-static void update_usb_device_state(struct usb_device *udev,
-				    enum usb_device_state new_state)
-{
-	if (udev->state == USB_STATE_SUSPENDED &&
-	    new_state != USB_STATE_SUSPENDED)
-		udev->active_duration -= jiffies;
-	else if (new_state == USB_STATE_SUSPENDED &&
-		 udev->state != USB_STATE_SUSPENDED)
-		udev->active_duration += jiffies;
-
-	udev->state = new_state;
-	update_port_device_state(udev);
-	trace_usb_set_device_state(dev_name(&udev->dev), udev->speed, udev->state, udev->bus_mA,
-				   udev->authorized);
-}
-
 static void recursively_mark_NOTATTACHED(struct usb_device *udev)
 {
 	struct usb_hub *hub = usb_hub_to_struct_hub(udev);
@@ -2175,7 +2131,10 @@ static void recursively_mark_NOTATTACHED(struct usb_device *udev)
 		if (hub->ports[i]->child)
 			recursively_mark_NOTATTACHED(hub->ports[i]->child);
 	}
-	update_usb_device_state(udev, USB_STATE_NOTATTACHED);
+	if (udev->state == USB_STATE_SUSPENDED)
+		udev->active_duration -= jiffies;
+	udev->state = USB_STATE_NOTATTACHED;
+	update_port_device_state(udev);
 }
 
 /**
@@ -2225,7 +2184,14 @@ void usb_set_device_state(struct usb_device *udev,
 			else
 				wakeup = 0;
 		}
-		update_usb_device_state(udev, new_state);
+		if (udev->state == USB_STATE_SUSPENDED &&
+			new_state != USB_STATE_SUSPENDED)
+			udev->active_duration -= jiffies;
+		else if (new_state == USB_STATE_SUSPENDED &&
+				udev->state != USB_STATE_SUSPENDED)
+			udev->active_duration += jiffies;
+		udev->state = new_state;
+		update_port_device_state(udev);
 	} else
 		recursively_mark_NOTATTACHED(udev);
 	spin_unlock_irqrestore(&device_state_lock, flags);
@@ -2373,9 +2339,6 @@ void usb_disconnect(struct usb_device **pdev)
 
 	usb_remove_ep_devs(&udev->ep0);
 	usb_unlock_device(udev);
-
-	if (udev->usb4_link)
-		device_link_del(udev->usb4_link);
 
 	/* Unregister the device.  The device driver is responsible
 	 * for de-configuring the device and invoking the remove-device
@@ -2676,6 +2639,11 @@ int usb_new_device(struct usb_device *udev)
 	dev_dbg(&udev->dev, "udev %d, busnum %d, minor = %d\n",
 			udev->devnum, udev->bus->busnum,
 			(((udev->bus->busnum-1) * 128) + (udev->devnum-1)));
+
+	trace_android_vh_usb_new_device_added(udev, &err);
+	if (err)
+		goto fail;
+
 	/* export the usbdev device-node for libusb */
 	udev->dev.devt = MKDEV(USB_DEVICE_MAJOR,
 			(((udev->bus->busnum-1) * 128) + (udev->devnum-1)));

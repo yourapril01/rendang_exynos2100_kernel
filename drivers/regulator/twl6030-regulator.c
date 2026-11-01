@@ -13,6 +13,7 @@
 #include <linux/err.h>
 #include <linux/platform_device.h>
 #include <linux/of.h>
+#include <linux/of_device.h>
 #include <linux/regulator/driver.h>
 #include <linux/regulator/machine.h>
 #include <linux/regulator/of_regulator.h>
@@ -318,7 +319,7 @@ static int twl6030smps_list_voltage(struct regulator_dev *rdev, unsigned index)
 	switch (info->flags) {
 	case SMPS_OFFSET_EN:
 		voltage = 100000;
-		fallthrough;
+		/* fall through */
 	case 0:
 		switch (index) {
 		case 0:
@@ -501,7 +502,7 @@ static const struct regulator_ops twlsmps_ops = {
 };
 
 /*----------------------------------------------------------------------*/
-static const struct linear_range twl6030ldo_linear_range[] = {
+static const struct regulator_linear_range twl6030ldo_linear_range[] = {
 	REGULATOR_LINEAR_RANGE(0, 0, 0, 0),
 	REGULATOR_LINEAR_RANGE(1000000, 1, 24, 100000),
 	REGULATOR_LINEAR_RANGE(2750000, 31, 31, 0),
@@ -728,7 +729,7 @@ static int twlreg_probe(struct platform_device *pdev)
 		break;
 	}
 
-	if (of_property_read_bool(np, "ti,retain-on-reset"))
+	if (of_get_property(np, "ti,retain-on-reset", NULL))
 		info->flags |= TWL_6030_WARM_RESET;
 
 	config.dev = &pdev->dev;
@@ -764,7 +765,6 @@ static struct platform_driver twlreg_driver = {
 	 */
 	.driver  = {
 		.name  = "twl6030_reg",
-		.probe_type = PROBE_PREFER_ASYNCHRONOUS,
 		.of_match_table = of_match_ptr(twl_of_match),
 	},
 };

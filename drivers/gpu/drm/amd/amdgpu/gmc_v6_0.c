@@ -762,9 +762,9 @@ static int gmc_v6_0_convert_vram_type(int mc_seq_vram_type)
 	}
 }
 
-static int gmc_v6_0_early_init(struct amdgpu_ip_block *ip_block)
+static int gmc_v6_0_early_init(void *handle)
 {
-	struct amdgpu_device *adev = ip_block->adev;
+	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
 
 	gmc_v6_0_set_gmc_funcs(adev);
 	gmc_v6_0_set_irq_funcs(adev);

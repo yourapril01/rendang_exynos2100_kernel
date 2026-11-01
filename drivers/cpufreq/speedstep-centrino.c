@@ -400,12 +400,16 @@ static int centrino_cpu_init(struct cpufreq_policy *policy)
 	return 0;
 }
 
-static void centrino_cpu_exit(struct cpufreq_policy *policy)
+static int centrino_cpu_exit(struct cpufreq_policy *policy)
 {
 	unsigned int cpu = policy->cpu;
 
-	if (per_cpu(centrino_model, cpu))
-		per_cpu(centrino_model, cpu) = NULL;
+	if (!per_cpu(centrino_model, cpu))
+		return -ENODEV;
+
+	per_cpu(centrino_model, cpu) = NULL;
+
+	return 0;
 }
 
 /**
@@ -516,12 +520,18 @@ static struct cpufreq_driver centrino_driver = {
  * or ASCII model IDs.
  */
 static const struct x86_cpu_id centrino_ids[] = {
-	X86_MATCH_VFM_FEATURE(IFM( 6,  9), X86_FEATURE_EST, NULL),
-	X86_MATCH_VFM_FEATURE(IFM( 6, 13), X86_FEATURE_EST, NULL),
-	X86_MATCH_VFM_FEATURE(IFM(15,  3), X86_FEATURE_EST, NULL),
-	X86_MATCH_VFM_FEATURE(IFM(15,  4), X86_FEATURE_EST, NULL),
+	{ X86_VENDOR_INTEL, 6, 9, X86_FEATURE_EST },
+	{ X86_VENDOR_INTEL, 6, 13, X86_FEATURE_EST },
+	{ X86_VENDOR_INTEL, 6, 13, X86_FEATURE_EST },
+	{ X86_VENDOR_INTEL, 6, 13, X86_FEATURE_EST },
+	{ X86_VENDOR_INTEL, 15, 3, X86_FEATURE_EST },
+	{ X86_VENDOR_INTEL, 15, 4, X86_FEATURE_EST },
 	{}
 };
+#if 0
+/* Autoload or not? Do not for now. */
+MODULE_DEVICE_TABLE(x86cpu, centrino_ids);
+#endif
 
 /**
  * centrino_init - initializes the Enhanced SpeedStep CPUFreq driver

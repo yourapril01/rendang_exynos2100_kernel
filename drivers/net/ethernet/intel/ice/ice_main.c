@@ -3193,14 +3193,12 @@ static irqreturn_t ice_ll_ts_intr(int __always_unused irq, void *data)
 	hw = &pf->hw;
 	tx = &pf->ptp.port.tx;
 	spin_lock_irqsave(&tx->lock, flags);
-	if (tx->init) {
-		ice_ptp_complete_tx_single_tstamp(tx);
+	ice_ptp_complete_tx_single_tstamp(tx);
 
-		idx = find_next_bit_wrap(tx->in_use, tx->len,
-					 tx->last_ll_ts_idx_read + 1);
-		if (idx != tx->len)
-			ice_ptp_req_tx_single_tstamp(tx, idx);
-	}
+	idx = find_next_bit_wrap(tx->in_use, tx->len,
+				 tx->last_ll_ts_idx_read + 1);
+	if (idx != tx->len)
+		ice_ptp_req_tx_single_tstamp(tx, idx);
 	spin_unlock_irqrestore(&tx->lock, flags);
 
 	val = GLINT_DYN_CTL_INTENA_M | GLINT_DYN_CTL_CLEARPBA_M |
@@ -3808,7 +3806,7 @@ int ice_vlan_rx_add_vid(struct net_device *netdev, __be16 proto, u16 vid)
 		ret = ice_fltr_set_vsi_promisc(&vsi->back->hw, vsi->idx,
 					       ICE_MCAST_VLAN_PROMISC_BITS,
 					       vid);
-		if (ret && ret != -EEXIST)
+		if (ret)
 			goto finish;
 	}
 
@@ -4197,12 +4195,6 @@ int ice_vsi_recfg_qs(struct ice_vsi *vsi, int new_rx, int new_tx, bool locked)
 	}
 	ice_pf_dcb_recfg(pf, locked);
 	ice_vsi_open(vsi);
-	/* Rx rings are reallocated during VSI rebuild and lose their ptp_rx
-	 * flag. Restore timestamp mode so newly allocated rings are set up
-	 * for hardware Rx timestamping.
-	 */
-	if (test_bit(ICE_FLAG_PTP_SUPPORTED, pf->flags))
-		ice_ptp_restore_timestamp_mode(pf);
 	goto done;
 
 rebuild_err:
@@ -4567,23 +4559,17 @@ ice_init_tx_topology(struct ice_hw *hw, const struct firmware *firmware)
 			dev_info(dev, "Tx scheduling layers switching feature disabled\n");
 		else
 			dev_info(dev, "Tx scheduling layers switching feature enabled\n");
-		return 0;
-	} else if (err == -ENODEV) {
-		/* If we failed to re-initialize the device, we can no longer
-		 * continue loading.
+		/* if there was a change in topology ice_cfg_tx_topo triggered
+		 * a CORER and we need to re-init hw
 		 */
-		dev_warn(dev, "Failed to initialize hardware after applying Tx scheduling configuration.\n");
+		ice_deinit_hw(hw);
+		err = ice_init_hw(hw);
+
 		return err;
 	} else if (err == -EIO) {
 		dev_info(dev, "DDP package does not support Tx scheduling layers switching feature - please update to the latest DDP package and try again\n");
-		return 0;
-	} else if (err == -EEXIST) {
-		return 0;
 	}
 
-	/* Do not treat this as a fatal error. */
-	dev_info(dev, "Failed to apply Tx scheduling configuration, err %pe\n",
-		 ERR_PTR(err));
 	return 0;
 }
 
@@ -4817,6 +4803,7 @@ int ice_init_dev(struct ice_pf *pf)
 
 	pf->hw.udp_tunnel_nic.set_port = ice_udp_tunnel_set_port;
 	pf->hw.udp_tunnel_nic.unset_port = ice_udp_tunnel_unset_port;
+	pf->hw.udp_tunnel_nic.flags = UDP_TUNNEL_NIC_INFO_MAY_SLEEP;
 	pf->hw.udp_tunnel_nic.shared = &pf->hw.udp_tunnel_shared;
 	if (pf->hw.tnl.valid_count[TNL_VXLAN]) {
 		pf->hw.udp_tunnel_nic.tables[0].n_entries =
@@ -4925,7 +4912,6 @@ static void ice_deinit_features(struct ice_pf *pf)
 		ice_dpll_deinit(pf);
 	if (pf->eswitch_mode == DEVLINK_ESWITCH_MODE_SWITCHDEV)
 		xa_destroy(&pf->eswitch.reprs);
-	ice_hwmon_exit(pf);
 }
 
 static void ice_init_wakeup(struct ice_pf *pf)
@@ -4943,14 +4929,16 @@ static void ice_init_wakeup(struct ice_pf *pf)
 	device_set_wakeup_enable(ice_pf_to_dev(pf), false);
 }
 
-static void ice_init_link(struct ice_pf *pf)
+static int ice_init_link(struct ice_pf *pf)
 {
 	struct device *dev = ice_pf_to_dev(pf);
 	int err;
 
 	err = ice_init_link_events(pf->hw.port_info);
-	if (err)
+	if (err) {
 		dev_err(dev, "ice_init_link_events failed: %d\n", err);
+		return err;
+	}
 
 	/* not a fatal error if this fails */
 	err = ice_init_nvm_phy_type(pf->hw.port_info);
@@ -4984,6 +4972,8 @@ static void ice_init_link(struct ice_pf *pf)
 	} else {
 		set_bit(ICE_FLAG_NO_MEDIA, pf->flags);
 	}
+
+	return err;
 }
 
 static int ice_init_pf_sw(struct ice_pf *pf)
@@ -5115,11 +5105,13 @@ static int ice_init(struct ice_pf *pf)
 
 	ice_init_wakeup(pf);
 
-	ice_init_link(pf);
+	err = ice_init_link(pf);
+	if (err)
+		goto err_init_link;
 
 	err = ice_send_version(pf);
 	if (err)
-		goto err_deinit_pf_sw;
+		goto err_init_link;
 
 	ice_verify_cacheline_size(pf);
 
@@ -5138,7 +5130,7 @@ static int ice_init(struct ice_pf *pf)
 
 	return 0;
 
-err_deinit_pf_sw:
+err_init_link:
 	ice_deinit_pf_sw(pf);
 err_init_pf_sw:
 	ice_dealloc_vsis(pf);
@@ -5450,6 +5442,8 @@ static void ice_remove(struct pci_dev *pdev)
 		set_bit(ICE_VF_RESETS_DISABLED, pf->state);
 		ice_free_vfs(pf);
 	}
+
+	ice_hwmon_exit(pf);
 
 	ice_service_task_stop(pf);
 	ice_aq_cancel_waiting_tasks(pf);
@@ -6972,6 +6966,7 @@ void ice_update_vsi_stats(struct ice_vsi *vsi)
 		cur_ns->rx_errors = pf->stats.crc_errors +
 				    pf->stats.illegal_bytes +
 				    pf->stats.rx_undersize +
+				    pf->hw_csum_rx_error +
 				    pf->stats.rx_jabber +
 				    pf->stats.rx_fragments +
 				    pf->stats.rx_oversize;
@@ -7791,9 +7786,6 @@ static void ice_rebuild(struct ice_pf *pf, enum ice_reset_req reset_type)
 
 	/* Restore timestamp mode settings after VSI rebuild */
 	ice_ptp_restore_timestamp_mode(pf);
-
-	/* Start PTP periodic work after VSI is fully rebuilt */
-	ice_ptp_queue_work(pf);
 	return;
 
 err_vsi_rebuild:
@@ -8043,34 +8035,6 @@ int ice_get_rss_key(struct ice_vsi *vsi, u8 *seed)
 }
 
 /**
- * ice_get_rss - Get RSS LUT and/or key
- * @vsi: Pointer to VSI structure
- * @seed: Buffer to store the key in
- * @lut: Buffer to store the lookup table entries
- * @lut_size: Size of buffer to store the lookup table entries
- *
- * Return: 0 on success, negative on failure
- */
-int ice_get_rss(struct ice_vsi *vsi, u8 *seed, u8 *lut, u16 lut_size)
-{
-	int err;
-
-	if (seed) {
-		err = ice_get_rss_key(vsi, seed);
-		if (err)
-			return err;
-	}
-
-	if (lut) {
-		err = ice_get_rss_lut(vsi, lut, lut_size);
-		if (err)
-			return err;
-	}
-
-	return 0;
-}
-
-/**
  * ice_set_rss_hfunc - Set RSS HASH function
  * @vsi: Pointer to VSI structure
  * @hfunc: hash function (ICE_AQ_VSI_Q_OPT_RSS_*)
@@ -8101,7 +8065,7 @@ int ice_set_rss_hfunc(struct ice_vsi *vsi, u8 hfunc)
 	ctx->info.q_opt_rss |=
 		FIELD_PREP(ICE_AQ_VSI_Q_OPT_RSS_HASH_M, hfunc);
 	ctx->info.q_opt_tc = vsi->info.q_opt_tc;
-	ctx->info.q_opt_flags = vsi->info.q_opt_flags;
+	ctx->info.q_opt_flags = vsi->info.q_opt_rss;
 
 	err = ice_update_vsi(hw, vsi->idx, ctx, NULL);
 	if (err) {
@@ -9137,7 +9101,7 @@ static int ice_create_q_channels(struct ice_vsi *vsi)
 		list_add_tail(&ch->list, &vsi->ch_list);
 		vsi->tc_map_vsi[i] = ch->ch_vsi;
 		dev_dbg(ice_pf_to_dev(pf),
-			"successfully created channel: VSI %p\n", ch->ch_vsi);
+			"successfully created channel: VSI %pK\n", ch->ch_vsi);
 	}
 	return 0;
 
@@ -9573,6 +9537,9 @@ int ice_open_internal(struct net_device *netdev)
 	if (err)
 		netdev_err(netdev, "Failed to open VSI 0x%04X on switch 0x%04X\n",
 			   vsi->vsi_num, vsi->vsw->sw_id);
+
+	/* Update existing tunnels information */
+	udp_tunnel_get_rx_info(netdev);
 
 	return err;
 }

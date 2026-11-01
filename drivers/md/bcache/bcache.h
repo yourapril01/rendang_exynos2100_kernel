@@ -273,8 +273,6 @@ struct bcache_device {
 
 	struct bio_set		bio_split;
 
-	struct bio_set		bio_detached;
-
 	unsigned int		data_csum:1;
 
 	int (*cache_miss)(struct btree *b, struct search *s,
@@ -460,7 +458,7 @@ struct cache {
 	/* Allocation stuff: */
 	struct bucket		*buckets;
 
-	DECLARE_HEAP(struct bucket *, heap);
+	DEFINE_MIN_HEAP(struct bucket *, cache_heap) heap;
 
 	/*
 	 * If nonzero, we know we aren't going to find any buckets to invalidate
@@ -755,13 +753,6 @@ struct bbio {
 		 */
 	};
 	struct bio		bio;
-};
-
-struct detached_dev_io_private {
-	struct bcache_device	*d;
-	unsigned long		start_time;
-	struct bio		*orig_bio;
-	struct bio              bio;
 };
 
 #define BTREE_PRIO		USHRT_MAX

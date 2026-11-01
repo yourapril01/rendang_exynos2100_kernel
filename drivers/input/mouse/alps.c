@@ -986,7 +986,7 @@ static void alps_get_finger_coordinate_v7(struct input_mt_pos *mt,
 	case V7_PACKET_ID_TWO:
 		mt[1].x &= ~0x000F;
 		mt[1].y |= 0x000F;
-		/* Detect false-positive touches where x & y report max value */
+		/* Detect false-postive touches where x & y report max value */
 		if (mt[1].y == 0x7ff && mt[1].x == 0xff0) {
 			mt[1].x = 0;
 			/* y gets set to 0 at the end of this function */
@@ -1396,16 +1396,24 @@ static bool alps_is_valid_package_ss4_v2(struct psmouse *psmouse)
 
 static DEFINE_MUTEX(alps_mutex);
 
-static int alps_do_register_bare_ps2_mouse(struct alps_data *priv)
+static void alps_register_bare_ps2_mouse(struct work_struct *work)
 {
+	struct alps_data *priv =
+		container_of(work, struct alps_data, dev3_register_work.work);
 	struct psmouse *psmouse = priv->psmouse;
 	struct input_dev *dev3;
-	int error;
+	int error = 0;
+
+	mutex_lock(&alps_mutex);
+
+	if (priv->dev3)
+		goto out;
 
 	dev3 = input_allocate_device();
 	if (!dev3) {
 		psmouse_err(psmouse, "failed to allocate secondary device\n");
-		return -ENOMEM;
+		error = -ENOMEM;
+		goto out;
 	}
 
 	snprintf(priv->phys3, sizeof(priv->phys3), "%s/%s",
@@ -1438,35 +1446,21 @@ static int alps_do_register_bare_ps2_mouse(struct alps_data *priv)
 		psmouse_err(psmouse,
 			    "failed to register secondary device: %d\n",
 			    error);
-		goto err_free_input;
+		input_free_device(dev3);
+		goto out;
 	}
 
 	priv->dev3 = dev3;
-	return 0;
 
-err_free_input:
-	input_free_device(dev3);
-	return error;
-}
+out:
+	/*
+	 * Save the error code so that we can detect that we
+	 * already tried to create the device.
+	 */
+	if (error)
+		priv->dev3 = ERR_PTR(error);
 
-static void alps_register_bare_ps2_mouse(struct work_struct *work)
-{
-	struct alps_data *priv = container_of(work, struct alps_data,
-					      dev3_register_work.work);
-	int error;
-
-	guard(mutex)(&alps_mutex);
-
-	if (!priv->dev3) {
-		error = alps_do_register_bare_ps2_mouse(priv);
-		if (error) {
-			/*
-			 * Save the error code so that we can detect that we
-			 * already tried to create the device.
-			 */
-			priv->dev3 = ERR_PTR(error);
-		}
-	}
+	mutex_unlock(&alps_mutex);
 }
 
 static void alps_report_bare_ps2_packet(struct psmouse *psmouse,
@@ -1935,7 +1929,7 @@ static int alps_monitor_mode(struct psmouse *psmouse, bool enable)
 static int alps_absolute_mode_v6(struct psmouse *psmouse)
 {
 	u16 reg_val = 0x181;
-	int ret;
+	int ret = -1;
 
 	/* enter monitor mode, to write the register */
 	if (alps_monitor_mode(psmouse, true))
@@ -2976,8 +2970,7 @@ static void alps_disconnect(struct psmouse *psmouse)
 	struct alps_data *priv = psmouse->private;
 
 	psmouse_reset(psmouse);
-	timer_shutdown_sync(&priv->timer);
-	disable_delayed_work_sync(&priv->dev3_register_work);
+	del_timer_sync(&priv->timer);
 	if (priv->dev2)
 		input_unregister_device(priv->dev2);
 	if (!IS_ERR_OR_NULL(priv->dev3))
@@ -3208,7 +3201,7 @@ int alps_detect(struct psmouse *psmouse, bool set_properties)
 	 */
 	psmouse_reset(psmouse);
 
-	priv = kzalloc(sizeof(*priv), GFP_KERNEL);
+	priv = kzalloc(sizeof(struct alps_data), GFP_KERNEL);
 	if (!priv)
 		return -ENOMEM;
 

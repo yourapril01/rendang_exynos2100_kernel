@@ -549,7 +549,6 @@ static void update_device_info(struct xe_device *xe)
 	/* disable features that are not available/applicable to VFs */
 	if (IS_SRIOV_VF(xe)) {
 		xe->info.probe_display = 0;
-		xe->info.has_heci_cscfi = 0;
 		xe->info.has_heci_gscfi = 0;
 		xe->info.skip_guc_pc = 1;
 		xe->info.skip_pcode = 1;
@@ -783,7 +782,6 @@ err:
 static void xe_device_remove_display(struct xe_device *xe)
 {
 	xe_display_unregister(xe);
-	drm_dev_unregister(&xe->drm);
 
 	drm_dev_unplug(&xe->drm);
 	xe_display_driver_remove(xe);
@@ -815,16 +813,16 @@ void xe_device_shutdown(struct xe_device *xe)
 
 	drm_dbg(&xe->drm, "Shutting down device\n");
 
-	xe_display_pm_shutdown(xe);
+	if (xe_driver_flr_disabled(xe)) {
+		xe_display_pm_shutdown(xe);
 
-	xe_irq_suspend(xe);
+		xe_irq_suspend(xe);
 
-	for_each_gt(gt, xe, id)
-		xe_gt_shutdown(gt);
+		for_each_gt(gt, xe, id)
+			xe_gt_shutdown(gt);
 
-	xe_display_pm_shutdown_late(xe);
-
-	if (!xe_driver_flr_disabled(xe)) {
+		xe_display_pm_shutdown_late(xe);
+	} else {
 		/* BOOM! */
 		__xe_driver_flr(xe);
 	}

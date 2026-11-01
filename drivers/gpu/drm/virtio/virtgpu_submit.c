@@ -65,10 +65,8 @@ static int virtio_gpu_dma_fence_wait(struct virtio_gpu_submit *submit,
 
 	dma_fence_unwrap_for_each(f, &itr, fence) {
 		err = virtio_gpu_do_fence_wait(submit, f);
-		if (err) {
-			dma_fence_put(itr.chain);
+		if (err)
 			return err;
-		}
 	}
 
 	return 0;

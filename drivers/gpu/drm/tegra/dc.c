@@ -100,10 +100,8 @@ bool tegra_dc_has_output(struct tegra_dc *dc, struct device *dev)
 	int err;
 
 	of_for_each_phandle(&it, err, np, "nvidia,outputs", NULL, 0)
-		if (it.node == dev->of_node) {
-			of_node_put(it.node);
+		if (it.node == dev->of_node)
 			return true;
-		}
 
 	return false;
 }
@@ -3149,7 +3147,6 @@ static int tegra_dc_couple(struct tegra_dc *dc)
 		dc->client.parent = &parent->client;
 
 		dev_dbg(dc->dev, "coupled to %s\n", dev_name(companion));
-		put_device(companion);
 	}
 
 	return 0;

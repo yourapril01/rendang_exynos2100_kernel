@@ -49,6 +49,10 @@
 #include "drm_crtc_internal.h"
 #include "drm_internal.h"
 
+#include <linux/android_kabi.h>
+ANDROID_KABI_DECLONLY(dma_buf);
+ANDROID_KABI_DECLONLY(dma_buf_attachment);
+
 /* from BKL pushdown */
 DEFINE_MUTEX(drm_global_mutex);
 
@@ -825,11 +829,8 @@ void drm_send_event(struct drm_device *dev, struct drm_pending_event *e)
 }
 EXPORT_SYMBOL(drm_send_event);
 
-void drm_fdinfo_print_size(struct drm_printer *p,
-			   const char *prefix,
-			   const char *stat,
-			   const char *region,
-			   u64 sz)
+static void print_size(struct drm_printer *p, const char *stat,
+		       const char *region, u64 sz)
 {
 	const char *units[] = {"", " KiB", " MiB"};
 	unsigned u;
@@ -840,10 +841,8 @@ void drm_fdinfo_print_size(struct drm_printer *p,
 		sz = div_u64(sz, SZ_1K);
 	}
 
-	drm_printf(p, "%s-%s-%s:\t%llu%s\n",
-		   prefix, stat, region, sz, units[u]);
+	drm_printf(p, "drm-%s-%s:\t%llu%s\n", stat, region, sz, units[u]);
 }
-EXPORT_SYMBOL(drm_fdinfo_print_size);
 
 /**
  * drm_print_memory_stats - A helper to print memory stats
@@ -858,20 +857,15 @@ void drm_print_memory_stats(struct drm_printer *p,
 			    enum drm_gem_object_status supported_status,
 			    const char *region)
 {
-	const char *prefix = "drm";
-
-	drm_fdinfo_print_size(p, prefix, "total", region,
-			      stats->private + stats->shared);
-	drm_fdinfo_print_size(p, prefix, "shared", region, stats->shared);
-	drm_fdinfo_print_size(p, prefix, "active", region, stats->active);
+	print_size(p, "total", region, stats->private + stats->shared);
+	print_size(p, "shared", region, stats->shared);
+	print_size(p, "active", region, stats->active);
 
 	if (supported_status & DRM_GEM_OBJECT_RESIDENT)
-		drm_fdinfo_print_size(p, prefix, "resident", region,
-				      stats->resident);
+		print_size(p, "resident", region, stats->resident);
 
 	if (supported_status & DRM_GEM_OBJECT_PURGEABLE)
-		drm_fdinfo_print_size(p, prefix, "purgeable", region,
-				      stats->purgeable);
+		print_size(p, "purgeable", region, stats->purgeable);
 }
 EXPORT_SYMBOL(drm_print_memory_stats);
 

@@ -1011,7 +1011,7 @@ static void qca_dmp_hdr(struct hci_dev *hdev, struct sk_buff *skb)
 	skb_put_data(skb, buf, strlen(buf));
 
 	snprintf(buf, sizeof(buf), "Driver: %s\n",
-		 hu->serdev ? hu->serdev->dev.driver->name : "hci_ldisc_qca");
+		hu->serdev->dev.driver->name);
 	skb_put_data(skb, buf, strlen(buf));
 }
 
@@ -1987,23 +1987,19 @@ retry:
 	}
 
 out:
-	if (ret) {
+	if (ret && retries < MAX_INIT_RETRIES) {
+		bt_dev_warn(hdev, "Retry BT power ON:%d", retries);
 		qca_power_shutdown(hu);
-
-		if (retries < MAX_INIT_RETRIES) {
-			bt_dev_warn(hdev, "Retry BT power ON:%d", retries);
-			if (hu->serdev) {
-				serdev_device_close(hu->serdev);
-				ret = serdev_device_open(hu->serdev);
-				if (ret) {
-					bt_dev_err(hdev, "failed to open port");
-					return ret;
-				}
+		if (hu->serdev) {
+			serdev_device_close(hu->serdev);
+			ret = serdev_device_open(hu->serdev);
+			if (ret) {
+				bt_dev_err(hdev, "failed to open port");
+				return ret;
 			}
-			retries++;
-			goto retry;
 		}
-		return ret;
+		retries++;
+		goto retry;
 	}
 
 	/* Setup bdaddr */
@@ -2367,17 +2363,10 @@ static int qca_serdev_probe(struct serdev_device *serdev)
 			 */
 			qcadev->bt_power->pwrseq = devm_pwrseq_get(&serdev->dev,
 								   "bluetooth");
-
-			/*
-			 * Some modules have BT_EN enabled via a hardware pull-up,
-			 * meaning it is not defined in the DTS and is not controlled
-			 * through the power sequence. In such cases, fall through
-			 * to follow the legacy flow.
-			 */
 			if (IS_ERR(qcadev->bt_power->pwrseq))
-				qcadev->bt_power->pwrseq = NULL;
-			else
-				break;
+				return PTR_ERR(qcadev->bt_power->pwrseq);
+
+			break;
 		}
 		fallthrough;
 	case QCA_WCN3988:

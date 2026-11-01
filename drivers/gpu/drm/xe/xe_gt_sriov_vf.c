@@ -959,15 +959,13 @@ void xe_gt_sriov_vf_write32(struct xe_gt *gt, struct xe_reg reg, u32 val)
 }
 
 /**
- * xe_gt_sriov_vf_print_config() - Print VF self config.
+ * xe_gt_sriov_vf_print_config - Print VF self config.
  * @gt: the &xe_gt
  * @p: the &drm_printer
  *
  * This function is for VF use only.
- *
- * Return: always 0.
  */
-int xe_gt_sriov_vf_print_config(struct xe_gt *gt, struct drm_printer *p)
+void xe_gt_sriov_vf_print_config(struct xe_gt *gt, struct drm_printer *p)
 {
 	struct xe_gt_sriov_vf_selfconfig *config = &gt->sriov.vf.self_config;
 	struct xe_device *xe = gt_to_xe(gt);
@@ -989,20 +987,16 @@ int xe_gt_sriov_vf_print_config(struct xe_gt *gt, struct drm_printer *p)
 
 	drm_printf(p, "GuC contexts:\t%u\n", config->num_ctxs);
 	drm_printf(p, "GuC doorbells:\t%u\n", config->num_dbs);
-
-	return 0;
 }
 
 /**
- * xe_gt_sriov_vf_print_runtime() - Print VF's runtime regs received from PF.
+ * xe_gt_sriov_vf_print_runtime - Print VF's runtime regs received from PF.
  * @gt: the &xe_gt
  * @p: the &drm_printer
  *
  * This function is for VF use only.
- *
- * Return: always 0.
  */
-int xe_gt_sriov_vf_print_runtime(struct xe_gt *gt, struct drm_printer *p)
+void xe_gt_sriov_vf_print_runtime(struct xe_gt *gt, struct drm_printer *p)
 {
 	struct vf_runtime_reg *vf_regs = gt->sriov.vf.runtime.regs;
 	unsigned int size = gt->sriov.vf.runtime.num_regs;
@@ -1011,20 +1005,16 @@ int xe_gt_sriov_vf_print_runtime(struct xe_gt *gt, struct drm_printer *p)
 
 	for (; size--; vf_regs++)
 		drm_printf(p, "%#x = %#x\n", vf_regs->offset, vf_regs->value);
-
-	return 0;
 }
 
 /**
- * xe_gt_sriov_vf_print_version() - Print VF ABI versions.
+ * xe_gt_sriov_vf_print_version - Print VF ABI versions.
  * @gt: the &xe_gt
  * @p: the &drm_printer
  *
  * This function is for VF use only.
- *
- * Return: always 0.
  */
-int xe_gt_sriov_vf_print_version(struct xe_gt *gt, struct drm_printer *p)
+void xe_gt_sriov_vf_print_version(struct xe_gt *gt, struct drm_printer *p)
 {
 	struct xe_gt_sriov_vf_guc_version *guc_version = &gt->sriov.vf.guc_version;
 	struct xe_gt_sriov_vf_relay_version *pf_version = &gt->sriov.vf.pf_version;
@@ -1052,6 +1042,4 @@ int xe_gt_sriov_vf_print_version(struct xe_gt *gt, struct drm_printer *p)
 		   GUC_RELAY_VERSION_LATEST_MAJOR, GUC_RELAY_VERSION_LATEST_MINOR);
 	drm_printf(p, "\thandshake:\t%u.%u\n",
 		   pf_version->major, pf_version->minor);
-
-	return 0;
 }

@@ -100,9 +100,9 @@ static void vcn_v1_0_ring_begin_use(struct amdgpu_ring *ring);
  * Set ring and irq function pointers
  * Load microcode from filesystem
  */
-static int vcn_v1_0_early_init(struct amdgpu_ip_block *ip_block)
+static int vcn_v1_0_early_init(void *handle)
 {
-	struct amdgpu_device *adev = ip_block->adev;
+	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
 
 	adev->vcn.num_enc_rings = 2;
 
@@ -110,7 +110,7 @@ static int vcn_v1_0_early_init(struct amdgpu_ip_block *ip_block)
 	vcn_v1_0_set_enc_ring_funcs(adev);
 	vcn_v1_0_set_irq_funcs(adev);
 
-	jpeg_v1_0_early_init(ip_block);
+	jpeg_v1_0_early_init(handle);
 
 	return amdgpu_vcn_early_init(adev);
 }
@@ -1957,9 +1957,9 @@ static void vcn_v1_0_print_ip_state(void *handle, struct drm_printer *p)
 	}
 }
 
-static void vcn_v1_0_dump_ip_state(struct amdgpu_ip_block *ip_block)
+static void vcn_v1_0_dump_ip_state(void *handle)
 {
-	struct amdgpu_device *adev = ip_block->adev;
+	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
 	int i, j;
 	bool is_powered;
 	uint32_t inst_off;

@@ -1277,8 +1277,7 @@ static int odm_combine_segments_show(struct seq_file *m, void *unused)
 	if (connector->status != connector_status_connected)
 		return -ENODEV;
 
-	if (pipe_ctx && pipe_ctx->stream_res.tg &&
-	    pipe_ctx->stream_res.tg->funcs->get_odm_combine_segments)
+	if (pipe_ctx != NULL && pipe_ctx->stream_res.tg->funcs->get_odm_combine_segments)
 		pipe_ctx->stream_res.tg->funcs->get_odm_combine_segments(pipe_ctx->stream_res.tg, &segments);
 
 	seq_printf(m, "%d\n", segments);
@@ -1314,12 +1313,7 @@ static ssize_t dp_sdp_message_debugfs_write(struct file *f, const char __user *b
 	if (size == 0)
 		return 0;
 
-	if (!connector->base.state || !connector->base.state->crtc)
-		return -ENODEV;
-
 	acrtc_state = to_dm_crtc_state(connector->base.state->crtc->state);
-
-	write_size = min_t(size_t, size, sizeof(data));
 
 	r = copy_from_user(data, buf, write_size);
 
@@ -3938,7 +3932,7 @@ static int capabilities_show(struct seq_file *m, void *unused)
 
 	struct hubbub *hubbub = dc->res_pool->hubbub;
 
-	if (hubbub && hubbub->funcs->get_mall_en)
+	if (hubbub->funcs->get_mall_en)
 		hubbub->funcs->get_mall_en(hubbub, &mall_in_use);
 
 	if (dc->cap_funcs.get_subvp_en)

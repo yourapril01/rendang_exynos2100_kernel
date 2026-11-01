@@ -106,7 +106,7 @@ static int remove_and_add_spares(struct mddev *mddev,
 				 struct md_rdev *this);
 static void mddev_detach(struct mddev *mddev);
 static void export_rdev(struct md_rdev *rdev, struct mddev *mddev);
-static void md_wakeup_thread_directly(struct md_thread __rcu **thread);
+static void md_wakeup_thread_directly(struct md_thread __rcu *thread);
 
 /*
  * Default number of read corrections we'll attempt on an rdev
@@ -470,17 +470,6 @@ int mddev_suspend(struct mddev *mddev, bool interruptible)
 	}
 
 	percpu_ref_kill(&mddev->active_io);
-
-	/*
-	 * RAID456 IO can sleep in wait_for_reshape while still holding an
-	 * active_io reference. If reshape is already interrupted or frozen,
-	 * wake those waiters so they can abort and drop the reference instead
-	 * of deadlocking suspend.
-	 */
-	if (mddev->pers && mddev->pers->prepare_suspend &&
-	    reshape_interrupted(mddev))
-		mddev->pers->prepare_suspend(mddev);
-
 	if (interruptible)
 		err = wait_event_interruptible(mddev->sb_wait,
 				percpu_ref_is_zero(&mddev->active_io));
@@ -3740,6 +3729,7 @@ out_free_rdev:
 
 static int analyze_sbs(struct mddev *mddev)
 {
+	int i;
 	struct md_rdev *rdev, *freshest, *tmp;
 
 	freshest = NULL;
@@ -3766,9 +3756,11 @@ static int analyze_sbs(struct mddev *mddev)
 	super_types[mddev->major_version].
 		validate_super(mddev, NULL/*freshest*/, freshest);
 
+	i = 0;
 	rdev_for_each_safe(rdev, tmp, mddev) {
 		if (mddev->max_disks &&
-		    rdev->desc_nr >= mddev->max_disks) {
+		    (rdev->desc_nr >= mddev->max_disks ||
+		     i > mddev->max_disks)) {
 			pr_warn("md: %s: %pg: only %d devices permitted\n",
 				mdname(mddev), rdev->bdev,
 				mddev->max_disks);
@@ -4186,7 +4178,7 @@ raid_disks_store(struct mddev *mddev, const char *buf, size_t len)
 	if (err < 0)
 		return err;
 
-	err = mddev_suspend_and_lock(mddev);
+	err = mddev_lock(mddev);
 	if (err)
 		return err;
 	if (mddev->pers)
@@ -4211,7 +4203,7 @@ raid_disks_store(struct mddev *mddev, const char *buf, size_t len)
 	} else
 		mddev->raid_disks = n;
 out_unlock:
-	mddev_unlock_and_resume(mddev);
+	mddev_unlock(mddev);
 	return err ? err : len;
 }
 static struct md_sysfs_entry md_raid_disks =
@@ -4907,7 +4899,7 @@ static void stop_sync_thread(struct mddev *mddev, bool locked)
 	 * Thread might be blocked waiting for metadata update which will now
 	 * never happen
 	 */
-	md_wakeup_thread_directly(&mddev->sync_thread);
+	md_wakeup_thread_directly(mddev->sync_thread);
 	if (work_pending(&mddev->sync_work))
 		flush_work(&mddev->sync_work);
 
@@ -8059,21 +8051,22 @@ static int md_thread(void *arg)
 	return 0;
 }
 
-static void md_wakeup_thread_directly(struct md_thread __rcu **thread)
+static void md_wakeup_thread_directly(struct md_thread __rcu *thread)
 {
 	struct md_thread *t;
 
 	rcu_read_lock();
-	t = rcu_dereference(*thread);
+	t = rcu_dereference(thread);
 	if (t)
 		wake_up_process(t->tsk);
 	rcu_read_unlock();
 }
 
-void __md_wakeup_thread(struct md_thread __rcu *thread)
+void md_wakeup_thread(struct md_thread __rcu *thread)
 {
 	struct md_thread *t;
 
+	rcu_read_lock();
 	t = rcu_dereference(thread);
 	if (t) {
 		pr_debug("md: waking up MD thread %s.\n", t->tsk->comm);
@@ -8081,8 +8074,9 @@ void __md_wakeup_thread(struct md_thread __rcu *thread)
 		if (wq_has_sleeper(&t->wqueue))
 			wake_up(&t->wqueue);
 	}
+	rcu_read_unlock();
 }
-EXPORT_SYMBOL(__md_wakeup_thread);
+EXPORT_SYMBOL(md_wakeup_thread);
 
 struct md_thread *md_register_thread(void (*run) (struct md_thread *),
 		struct mddev *mddev, const char *name)
@@ -9002,11 +8996,6 @@ void md_do_sync(struct md_thread *thread)
 	}
 
 	action = md_sync_action(mddev);
-	if (action == ACTION_FROZEN || action == ACTION_IDLE) {
-		set_bit(MD_RECOVERY_INTR, &mddev->recovery);
-		goto skip;
-	}
-
 	desc = md_sync_action_name(action);
 	mddev->last_sync_action = action;
 
@@ -9713,8 +9702,8 @@ void md_check_recovery(struct mddev *mddev)
 			 * remove disk.
 			 */
 			rdev_for_each_safe(rdev, tmp, mddev) {
-				if (rdev->raid_disk < 0 &&
-				    test_and_clear_bit(ClusterRemove, &rdev->flags))
+				if (test_and_clear_bit(ClusterRemove, &rdev->flags) &&
+						rdev->raid_disk < 0)
 					md_kick_rdev_from_array(rdev);
 			}
 		}
@@ -10011,11 +10000,8 @@ static void check_sb_changes(struct mddev *mddev, struct md_rdev *rdev)
 
 	/* Check for change of roles in the active devices */
 	rdev_for_each_safe(rdev2, tmp, mddev) {
-		if (test_bit(Faulty, &rdev2->flags)) {
-			if (test_bit(ClusterRemove, &rdev2->flags))
-				set_bit(MD_RECOVERY_NEEDED, &mddev->recovery);
+		if (test_bit(Faulty, &rdev2->flags))
 			continue;
-		}
 
 		/* Check if the roles changed */
 		role = le16_to_cpu(sb->dev_roles[rdev2->desc_nr]);

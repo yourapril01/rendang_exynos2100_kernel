@@ -532,9 +532,9 @@ static void ih_v6_1_set_self_irq_funcs(struct amdgpu_device *adev)
 	adev->irq.self_irq.funcs = &ih_v6_1_self_irq_funcs;
 }
 
-static int ih_v6_1_early_init(struct amdgpu_ip_block *ip_block)
+static int ih_v6_1_early_init(void *handle)
 {
-	struct amdgpu_device *adev = ip_block->adev;
+	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
 	int ret;
 
 	ret = amdgpu_irq_add_domain(adev);

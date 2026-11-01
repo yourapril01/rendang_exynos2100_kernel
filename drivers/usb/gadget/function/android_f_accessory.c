@@ -45,12 +45,6 @@
 #define TX_REQ_MAX 4
 #define RX_REQ_MAX 2
 
-/* Safe upper bound for a HID report descriptor*/
-#define MAX_HID_DESC_SIZE 4096
-
-/* Maximum number of concurrent AOA‑HID devices*/
-#define MAX_HID_DEVICES 32
-
 struct acc_hid_dev {
 	struct list_head list;
 	struct hid_device *hid;
@@ -129,6 +123,9 @@ struct acc_dev {
 
 	/* list of dead HID devices to unregister */
 	struct list_head dead_hid_list;
+
+	/* usb accessory restriction flag */
+	bool usb_acc_restrict;
 };
 
 static struct usb_interface_descriptor acc_interface_desc = {
@@ -505,7 +502,7 @@ static void acc_complete_send_hid_event(struct usb_ep *ep,
 		return;
 	}
 
-	__hid_report_raw_event(hid->hid, HID_INPUT_REPORT, req->buf, length, length, 1);
+	hid_report_raw_event(hid->hid, HID_INPUT_REPORT, req->buf, length, 1);
 }
 
 static int acc_hid_parse(struct hid_device *hid)
@@ -603,12 +600,8 @@ static int acc_register_hid(struct acc_dev *dev, int id, int desc_length)
 	struct acc_hid_dev *hid;
 	unsigned long flags;
 
-	/*
-	 * Report descriptor length must be > 0 and not exceed the maximum size.
-	 * Device ID must be > 0 and within the allowed range.
-	 */
-	if (desc_length <= 0 || desc_length > MAX_HID_DESC_SIZE ||
-			id <= 0 || id > MAX_HID_DEVICES)
+	/* report descriptor length must be > 0 */
+	if (desc_length <= 0)
 		return -EINVAL;
 
 	spin_lock_irqsave(&dev->lock, flags);
@@ -1351,8 +1344,57 @@ static struct configfs_item_operations acc_item_ops = {
 	.release        = acc_attr_release,
 };
 
+/* configfs attributes for usb_acc_restrict */
+static ssize_t usb_acc_restrict_show(struct config_item *item, char *page)
+{
+	struct acc_dev *dev = get_acc_dev();
+	int ret;
+
+	if (!dev)
+		return -ENODEV;
+
+	ret = sprintf(page, "%d\n", dev->usb_acc_restrict ? 1 : 0);
+	put_acc_dev(dev);
+	return ret;
+}
+
+static ssize_t usb_acc_restrict_store(struct config_item *item,
+				 const char *page, size_t len)
+{
+	struct acc_dev *dev = get_acc_dev();
+	bool val = false;
+
+	if (!dev)
+		return -ENODEV;
+
+	if (len == 1 && page[0] == '1')
+		val = true;
+	else if (len == 1 && page[0] == '0')
+		val = false;
+	else {
+		put_acc_dev(dev);
+		return -EINVAL;
+	}
+
+	dev->usb_acc_restrict = val;
+
+	pr_info("USB accessory HID restriction %s\n",
+		dev->usb_acc_restrict ? "enabled" : "disabled");
+
+	put_acc_dev(dev);
+	return len;
+}
+
+CONFIGFS_ATTR(usb_acc_, restrict);
+
+static struct configfs_attribute *acc_attrs[] = {
+	&usb_acc_attr_restrict,
+	NULL,
+};
+
 static struct config_item_type acc_func_type = {
 	.ct_item_ops    = &acc_item_ops,
+	.ct_attrs		= acc_attrs,
 	.ct_owner       = THIS_MODULE,
 };
 
@@ -1487,6 +1529,10 @@ static int __acc_setup(struct usb_composite_dev *cdev,
 	 */
 	if (!dev)
 		return -ENODEV;
+
+	/* Check if HID commands are restricted */
+	if (dev->usb_acc_restrict && (bRequest == ACCESSORY_REGISTER_HID))
+		goto err;
 
 	if (bRequestType == (USB_DIR_OUT | USB_TYPE_VENDOR)) {
 		if (bRequest == ACCESSORY_START) {

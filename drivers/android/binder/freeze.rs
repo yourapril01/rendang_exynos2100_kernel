@@ -60,7 +60,6 @@ type UninitFM = UniqueArc<core::mem::MaybeUninit<DTRWrap<FreezeMessage>>>;
 /// Represents a notification that the freeze state has changed.
 pub(crate) struct FreezeMessage {
     cookie: FreezeCookie,
-    pid: i32,
 }
 
 kernel::list::impl_list_arc_safe! {
@@ -74,8 +73,8 @@ impl FreezeMessage {
         UniqueArc::new_uninit(flags)
     }
 
-    fn init(ua: UninitFM, cookie: FreezeCookie, pid: i32) -> DLArc<FreezeMessage> {
-        match ua.pin_init_with(DTRWrap::new(FreezeMessage { cookie, pid })) {
+    fn init(ua: UninitFM, cookie: FreezeCookie) -> DLArc<FreezeMessage> {
+        match ua.pin_init_with(DTRWrap::new(FreezeMessage { cookie })) {
             Ok(msg) => ListArc::from(msg),
             Err(err) => match err {},
         }
@@ -107,22 +106,13 @@ impl DeliverToRead for FreezeMessage {
             return Ok(true);
         }
         if freeze.is_clearing {
-            assert_eq!(freeze.num_cleared_duplicates, 0);
-            if freeze.num_pending_duplicates > 0 {
-                // The primary freeze listener was deleted, so convert a pending duplicate back
-                // into the primary one.
-                freeze.num_pending_duplicates -= 1;
-                freeze.is_pending = true;
-                freeze.is_clearing = true;
-            } else {
-                _removed_listener = freeze_entry.remove_node();
-            }
+            _removed_listener = freeze_entry.remove_node();
             drop(node_refs);
             writer.write_code(BR_CLEAR_FREEZE_NOTIFICATION_DONE)?;
             writer.write_payload(&self.cookie.0)?;
             Ok(true)
         } else {
-            let is_frozen = freeze.node.owner.inner.lock().is_frozen.is_fully_frozen();
+            let is_frozen = freeze.node.owner.inner.lock().is_frozen;
             if freeze.last_is_frozen == Some(is_frozen) {
                 return Ok(true);
             }
@@ -141,14 +131,7 @@ impl DeliverToRead for FreezeMessage {
         }
     }
 
-    fn cancel(self: DArc<Self>) {
-        binder_debug!(
-            pid = self.pid,
-            DeadTransaction,
-            "undelivered freeze notification, {:016x}",
-            self.cookie.0
-        );
-    }
+    fn cancel(self: DArc<Self>) {}
     fn on_thread_selected(&self, _thread: &Thread) {}
 
     fn should_sync_wakeup(&self) -> bool {
@@ -156,24 +139,17 @@ impl DeliverToRead for FreezeMessage {
     }
 
     #[inline(never)]
-    fn debug_print(&self, m: &SeqFile, prefix: &str, _tprefix: &str, _hashed: bool) -> Result {
+    fn debug_print(&self, m: &SeqFile, prefix: &str, _tprefix: &str) -> Result<()> {
         seq_print!(m, "{}has frozen binder\n", prefix);
         Ok(())
     }
 }
 
 impl FreezeListener {
-    /// Called when this freeze listener is cleared abnormally.
-    ///
-    /// This occurs either because the process exited or because the process dropped its last
-    /// refcount on the node ref without explicitly removing the freeze listener first.
-    ///
-    /// The returned `KVVec` is just a value that should be dropped outside of the lock.
-    pub(crate) fn on_process_cleanup(&self, proc: &Process) -> KVVec<Arc<Process>> {
+    pub(crate) fn on_process_exit(&self, proc: &Arc<Process>) {
         if !self.is_clearing {
-            return self.node.remove_freeze_listener(proc);
+            self.node.remove_freeze_listener(proc);
         }
-        KVVec::new()
     }
 }
 
@@ -189,61 +165,36 @@ impl Process {
         let msg = FreezeMessage::new(GFP_KERNEL)?;
         let alloc = RBTreeNodeReservation::new(GFP_KERNEL)?;
 
-        let mut afl_vec_alloc = KVVec::new();
-        let mut info;
-        let mut freeze_entry;
         let mut node_refs_guard = self.node_refs.lock();
-        loop {
-            let node_refs = &mut *node_refs_guard;
-            info = match node_refs.by_handle.get_mut(&handle) {
-                Some(info) => info,
-                None => {
-                    binder_debug!(
-                        UserError,
-                        "BC_REQUEST_FREEZE_NOTIFICATION invalid ref {handle}"
-                    );
-                    return Err(EINVAL);
-                }
-            };
-            if info.freeze().is_some() {
-                binder_debug!(UserError, "BC_REQUEST_FREEZE_NOTIFICATION already set");
+        let node_refs = &mut *node_refs_guard;
+        let Some(info) = node_refs.by_handle.get_mut(&handle) else {
+            pr_warn!("BC_REQUEST_FREEZE_NOTIFICATION invalid ref {}\n", handle);
+            return Err(EINVAL);
+        };
+        if info.freeze().is_some() {
+            pr_warn!("BC_REQUEST_FREEZE_NOTIFICATION already set\n");
+            return Err(EINVAL);
+        }
+        let node_ref = info.node_ref();
+        let freeze_entry = node_refs.freeze_listeners.entry(cookie);
+
+        if let rbtree::Entry::Occupied(ref dupe) = freeze_entry {
+            if !dupe.get().allow_duplicate(&node_ref.node) {
+                pr_warn!("BC_REQUEST_FREEZE_NOTIFICATION duplicate cookie\n");
                 return Err(EINVAL);
             }
-            let node_ref = info.node_ref();
-            freeze_entry = node_refs.freeze_listeners.entry(cookie);
-
-            if let rbtree::Entry::Occupied(ref dupe) = freeze_entry {
-                if !dupe.get().allow_duplicate(&node_ref.node) {
-                    binder_debug!(UserError, "BC_REQUEST_FREEZE_NOTIFICATION duplicate cookie");
-                    return Err(EINVAL);
-                }
-            }
-
-            // Now we add to the node's freeze listener list, with retry and re-allocate if the
-            // vector is full.
-            //
-            // To ensure that the node is added atomically, this is the first time we modify any
-            // state. When this call succeeds, all other modifications must occur without the
-            // possibility for any failure paths.
-            match node_ref
-                .node
-                .add_freeze_listener(self, &mut afl_vec_alloc)?
-            {
-                Ok(()) => break,
-                Err(resize_target) => {
-                    drop(node_refs_guard);
-                    afl_vec_alloc = KVVec::with_capacity(resize_target, GFP_KERNEL)?;
-                    node_refs_guard = self.node_refs.lock();
-                }
-            }
         }
+
+        // All failure paths must come before this call, and all modifications must come after this
+        // call.
+        node_ref.node.add_freeze_listener(self, GFP_KERNEL)?;
 
         match freeze_entry {
             rbtree::Entry::Vacant(entry) => {
                 entry.insert(
                     FreezeListener {
                         cookie,
-                        node: info.node_ref().node.clone(),
+                        node: node_ref.node.clone(),
                         last_is_frozen: None,
                         is_pending: false,
                         is_clearing: false,
@@ -267,7 +218,7 @@ impl Process {
         }
 
         *info.freeze() = Some(cookie);
-        let msg = FreezeMessage::init(msg, cookie, self.task.pid());
+        let msg = FreezeMessage::init(msg, cookie);
         drop(node_refs_guard);
         let _ = self.push_work(msg);
         Ok(())
@@ -279,31 +230,25 @@ impl Process {
         let mut node_refs_guard = self.node_refs.lock();
         let node_refs = &mut *node_refs_guard;
         let Some(freeze) = node_refs.freeze_listeners.get_mut(&cookie) else {
-            binder_debug!(
-                UserError,
-                "BC_FREEZE_NOTIFICATION_DONE {:016x} not found",
-                cookie.0
-            );
+            pr_warn!("BC_FREEZE_NOTIFICATION_DONE {:016x} not found\n", cookie.0);
             return Err(EINVAL);
         };
         let mut clear_msg = None;
         if freeze.num_pending_duplicates > 0 {
-            clear_msg = Some(FreezeMessage::init(alloc, cookie, self.task.pid()));
+            clear_msg = Some(FreezeMessage::init(alloc, cookie));
             freeze.num_pending_duplicates -= 1;
             freeze.num_cleared_duplicates += 1;
         } else {
             if !freeze.is_pending {
-                binder_debug!(
-                    UserError,
-                    "BC_FREEZE_NOTIFICATION_DONE {:016x} not pending",
+                pr_warn!(
+                    "BC_FREEZE_NOTIFICATION_DONE {:016x} not pending\n",
                     cookie.0
                 );
                 return Err(EINVAL);
             }
-            let is_frozen = freeze.node.owner.inner.lock().is_frozen.is_fully_frozen();
-            if freeze.is_clearing || freeze.last_is_frozen != Some(is_frozen) {
-                // Immediately send another FreezeMessage.
-                clear_msg = Some(FreezeMessage::init(alloc, cookie, self.task.pid()));
+            if freeze.is_clearing {
+                // Immediately send another FreezeMessage for BR_CLEAR_FREEZE_NOTIFICATION_DONE.
+                clear_msg = Some(FreezeMessage::init(alloc, cookie));
             }
             freeze.is_pending = false;
         }
@@ -319,44 +264,31 @@ impl Process {
         let handle = hc.handle;
         let cookie = FreezeCookie(hc.cookie);
 
-        let _to_free_fl;
         let alloc = FreezeMessage::new(GFP_KERNEL)?;
         let mut node_refs_guard = self.node_refs.lock();
         let node_refs = &mut *node_refs_guard;
         let Some(info) = node_refs.by_handle.get_mut(&handle) else {
-            binder_debug!(
-                UserError,
-                "BC_CLEAR_FREEZE_NOTIFICATION invalid ref {handle}"
-            );
+            pr_warn!("BC_CLEAR_FREEZE_NOTIFICATION invalid ref {}\n", handle);
             return Err(EINVAL);
         };
         let Some(info_cookie) = info.freeze() else {
-            binder_debug!(
-                UserError,
-                "BC_CLEAR_FREEZE_NOTIFICATION freeze notification not active"
-            );
+            pr_warn!("BC_CLEAR_FREEZE_NOTIFICATION freeze notification not active\n");
             return Err(EINVAL);
         };
         if *info_cookie != cookie {
-            binder_debug!(
-                UserError,
-                "BC_CLEAR_FREEZE_NOTIFICATION freeze notification cookie mismatch"
-            );
+            pr_warn!("BC_CLEAR_FREEZE_NOTIFICATION freeze notification cookie mismatch\n");
             return Err(EINVAL);
         }
         let Some(listener) = node_refs.freeze_listeners.get_mut(&cookie) else {
-            binder_debug!(
-                UserError,
-                "BC_CLEAR_FREEZE_NOTIFICATION invalid cookie {handle}"
-            );
+            pr_warn!("BC_CLEAR_FREEZE_NOTIFICATION invalid cookie {}\n", handle);
             return Err(EINVAL);
         };
         listener.is_clearing = true;
-        _to_free_fl = listener.node.remove_freeze_listener(self);
+        listener.node.remove_freeze_listener(self);
         *info.freeze() = None;
         let mut msg = None;
         if !listener.is_pending {
-            msg = Some(FreezeMessage::init(alloc, cookie, self.task.pid()));
+            msg = Some(FreezeMessage::init(alloc, cookie));
         }
         drop(node_refs_guard);
 
@@ -412,7 +344,7 @@ impl Process {
                 recipients
                     .push_within_capacity(node_proc_pair)
                     .map_err(|_| {
-                        pr_err_ratelimited!(
+                        pr_err!(
                             "push_within_capacity failed even though we checked the capacity\n"
                         );
                         AllocError
@@ -435,7 +367,7 @@ impl Process {
                 continue;
             };
             let msg_alloc = FreezeMessage::new(GFP_KERNEL)?;
-            let msg = FreezeMessage::init(msg_alloc, cookie, proc.task.pid());
+            let msg = FreezeMessage::init(msg_alloc, cookie);
             batch.push((proc, msg), GFP_KERNEL)?;
         }
 

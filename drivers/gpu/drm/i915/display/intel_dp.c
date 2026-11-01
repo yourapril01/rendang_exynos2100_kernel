@@ -1506,12 +1506,6 @@ int intel_dp_rate_select(struct intel_dp *intel_dp, int rate)
 void intel_dp_compute_rate(struct intel_dp *intel_dp, int port_clock,
 			   u8 *link_bw, u8 *rate_select)
 {
-	struct drm_i915_private *i915 = dp_to_i915(intel_dp);
-
-	/* FIXME g4x can't generate an exact 2.7GHz with the 96MHz non-SSC refclk */
-	if (IS_G4X(i915) && port_clock == 268800)
-		port_clock = 270000;
-
 	/* eDP 1.4 rate select method. */
 	if (intel_dp->use_rate_select) {
 		*link_bw = 0;
@@ -2726,13 +2720,8 @@ static void intel_dp_compute_vsc_colorimetry(const struct intel_crtc_state *crtc
 	drm_WARN_ON(&dev_priv->drm,
 		    vsc->bpc == 6 && vsc->pixelformat != DP_PIXELFORMAT_RGB);
 
-	/* All YCbCr formats are always limited range. */
-	if (vsc->pixelformat == DP_PIXELFORMAT_RGB)
-		vsc->dynamic_range = crtc_state->limited_color_range ?
-			DP_DYNAMIC_RANGE_CTA : DP_DYNAMIC_RANGE_VESA;
-	else
-		vsc->dynamic_range = DP_DYNAMIC_RANGE_CTA;
-
+	/* all YCbCr are always limited range */
+	vsc->dynamic_range = DP_DYNAMIC_RANGE_CTA;
 	vsc->content_type = DP_CONTENT_TYPE_NOT_DEFINED;
 }
 
@@ -3388,11 +3377,8 @@ intel_edp_init_source_oui(struct intel_dp *intel_dp, bool careful)
 		if (drm_dp_dpcd_read(&intel_dp->aux, DP_SOURCE_OUI, buf, sizeof(buf)) < 0)
 			drm_err(&i915->drm, "Failed to read source OUI\n");
 
-		if (memcmp(oui, buf, sizeof(oui)) == 0) {
-			/* Assume the OUI was written now. */
-			intel_dp->last_oui_write = jiffies;
+		if (memcmp(oui, buf, sizeof(oui)) == 0)
 			return;
-		}
 	}
 
 	if (drm_dp_dpcd_write(&intel_dp->aux, DP_SOURCE_OUI, oui, sizeof(oui)) < 0)
@@ -4583,7 +4569,7 @@ int intel_dp_as_sdp_unpack(struct drm_dp_as_sdp *as_sdp,
 	as_sdp->length = sdp->sdp_header.HB3 & DP_ADAPTIVE_SYNC_SDP_LENGTH;
 	as_sdp->mode = sdp->db[0] & DP_ADAPTIVE_SYNC_SDP_OPERATION_MODE;
 	as_sdp->vtotal = (sdp->db[2] << 8) | sdp->db[1];
-	as_sdp->target_rr = ((sdp->db[4] & 0x3) << 8) | sdp->db[3];
+	as_sdp->target_rr = (u64)sdp->db[3] | ((u64)sdp->db[4] & 0x3);
 	as_sdp->target_rr_divider = sdp->db[4] & 0x20 ? true : false;
 
 	return 0;

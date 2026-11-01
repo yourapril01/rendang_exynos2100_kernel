@@ -223,6 +223,7 @@ static int eps_cpu_init(struct cpufreq_policy *policy)
 	case EPS_BRAND_C3:
 		pr_cont("C3\n");
 		return -ENODEV;
+		break;
 	}
 	/* Enable Enhanced PowerSaver */
 	rdmsrl(MSR_IA32_MISC_ENABLE, val);
@@ -360,13 +361,14 @@ static int eps_cpu_init(struct cpufreq_policy *policy)
 	return 0;
 }
 
-static void eps_cpu_exit(struct cpufreq_policy *policy)
+static int eps_cpu_exit(struct cpufreq_policy *policy)
 {
 	unsigned int cpu = policy->cpu;
 
 	/* Bye */
 	kfree(eps_cpu[cpu]);
 	eps_cpu[cpu] = NULL;
+	return 0;
 }
 
 static struct cpufreq_driver eps_driver = {
@@ -383,7 +385,7 @@ static struct cpufreq_driver eps_driver = {
 /* This driver will work only on Centaur C7 processors with
  * Enhanced SpeedStep/PowerSaver registers */
 static const struct x86_cpu_id eps_cpu_id[] = {
-	X86_MATCH_VENDOR_FAM_FEATURE(CENTAUR, 6, X86_FEATURE_EST, NULL),
+	{ X86_VENDOR_CENTAUR, 6, X86_MODEL_ANY, X86_FEATURE_EST },
 	{}
 };
 MODULE_DEVICE_TABLE(x86cpu, eps_cpu_id);

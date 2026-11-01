@@ -2291,8 +2291,6 @@ static int super_init_validation(struct raid_set *rs, struct md_rdev *rdev)
 
 			mddev->reshape_position = le64_to_cpu(sb->reshape_position);
 			rs->raid_type = get_raid_type_by_ll(mddev->level, mddev->layout);
-			if (!rs->raid_type)
-				return -EINVAL;
 		}
 
 	} else {
@@ -3813,10 +3811,8 @@ static void raid_io_hints(struct dm_target *ti, struct queue_limits *limits)
 	struct raid_set *rs = ti->private;
 	unsigned int chunk_size_bytes = to_bytes(rs->md.chunk_sectors);
 
-	if (chunk_size_bytes) {
-		limits->io_min = chunk_size_bytes;
-		limits->io_opt = chunk_size_bytes * mddev_data_stripes(rs);
-	}
+	limits->io_min = chunk_size_bytes;
+	limits->io_opt = chunk_size_bytes * mddev_data_stripes(rs);
 }
 
 static void raid_presuspend(struct dm_target *ti)

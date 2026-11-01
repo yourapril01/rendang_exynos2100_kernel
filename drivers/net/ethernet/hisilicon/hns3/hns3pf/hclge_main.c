@@ -582,7 +582,7 @@ static u64 *hclge_comm_get_stats(struct hclge_dev *hdev,
 				 int size, u64 *data)
 {
 	u64 *buf = data;
-	int i;
+	u32 i;
 
 	for (i = 0; i < size; i++) {
 		if (strs[i].stats_num > hdev->ae_dev->dev_specs.mac_stats_num)
@@ -595,21 +595,25 @@ static u64 *hclge_comm_get_stats(struct hclge_dev *hdev,
 	return buf;
 }
 
-static void hclge_comm_get_strings(struct hclge_dev *hdev, u32 stringset,
-				   const struct hclge_comm_stats_str strs[],
-				   int size, u8 **data)
+static u8 *hclge_comm_get_strings(struct hclge_dev *hdev, u32 stringset,
+				  const struct hclge_comm_stats_str strs[],
+				  int size, u8 *data)
 {
-	int i;
+	char *buff = (char *)data;
+	u32 i;
 
 	if (stringset != ETH_SS_STATS)
-		return;
+		return buff;
 
 	for (i = 0; i < size; i++) {
 		if (strs[i].stats_num > hdev->ae_dev->dev_specs.mac_stats_num)
 			continue;
 
-		ethtool_puts(data, strs[i].desc);
+		snprintf(buff, ETH_GSTRING_LEN, "%s", strs[i].desc);
+		buff = buff + ETH_GSTRING_LEN;
 	}
+
+	return (u8 *)buff;
 }
 
 static void hclge_update_stats_for_all(struct hclge_dev *hdev)
@@ -714,38 +718,44 @@ static int hclge_get_sset_count(struct hnae3_handle *handle, int stringset)
 }
 
 static void hclge_get_strings(struct hnae3_handle *handle, u32 stringset,
-			      u8 **data)
+			      u8 *data)
 {
 	struct hclge_vport *vport = hclge_get_vport(handle);
 	struct hclge_dev *hdev = vport->back;
-	const char *str;
+	u8 *p = (char *)data;
 	int size;
 
 	if (stringset == ETH_SS_STATS) {
 		size = ARRAY_SIZE(g_mac_stats_string);
-		hclge_comm_get_strings(hdev, stringset, g_mac_stats_string,
-				       size, data);
-		hclge_comm_tqps_get_strings(handle, data);
+		p = hclge_comm_get_strings(hdev, stringset, g_mac_stats_string,
+					   size, p);
+		p = hclge_comm_tqps_get_strings(handle, p);
 	} else if (stringset == ETH_SS_TEST) {
 		if (handle->flags & HNAE3_SUPPORT_EXTERNAL_LOOPBACK) {
-			str = hns3_nic_test_strs[HNAE3_LOOP_EXTERNAL];
-			ethtool_puts(data, str);
+			memcpy(p, hns3_nic_test_strs[HNAE3_LOOP_EXTERNAL],
+			       ETH_GSTRING_LEN);
+			p += ETH_GSTRING_LEN;
 		}
 		if (handle->flags & HNAE3_SUPPORT_APP_LOOPBACK) {
-			str = hns3_nic_test_strs[HNAE3_LOOP_APP];
-			ethtool_puts(data, str);
+			memcpy(p, hns3_nic_test_strs[HNAE3_LOOP_APP],
+			       ETH_GSTRING_LEN);
+			p += ETH_GSTRING_LEN;
 		}
 		if (handle->flags & HNAE3_SUPPORT_SERDES_SERIAL_LOOPBACK) {
-			str = hns3_nic_test_strs[HNAE3_LOOP_SERIAL_SERDES];
-			ethtool_puts(data, str);
+			memcpy(p, hns3_nic_test_strs[HNAE3_LOOP_SERIAL_SERDES],
+			       ETH_GSTRING_LEN);
+			p += ETH_GSTRING_LEN;
 		}
 		if (handle->flags & HNAE3_SUPPORT_SERDES_PARALLEL_LOOPBACK) {
-			str = hns3_nic_test_strs[HNAE3_LOOP_PARALLEL_SERDES];
-			ethtool_puts(data, str);
+			memcpy(p,
+			       hns3_nic_test_strs[HNAE3_LOOP_PARALLEL_SERDES],
+			       ETH_GSTRING_LEN);
+			p += ETH_GSTRING_LEN;
 		}
 		if (handle->flags & HNAE3_SUPPORT_PHY_LOOPBACK) {
-			str = hns3_nic_test_strs[HNAE3_LOOP_PHY];
-			ethtool_puts(data, str);
+			memcpy(p, hns3_nic_test_strs[HNAE3_LOOP_PHY],
+			       ETH_GSTRING_LEN);
+			p += ETH_GSTRING_LEN;
 		}
 	}
 }
@@ -1576,11 +1586,6 @@ static int hclge_configure(struct hclge_dev *hdev)
 	hdev->hw.mac.req_speed = hdev->hw.mac.speed;
 	hdev->hw.mac.req_autoneg = AUTONEG_ENABLE;
 	hdev->hw.mac.req_duplex = DUPLEX_FULL;
-
-	/* When lane_num is 0, the firmware will automatically
-	 * select the appropriate lane_num based on the speed.
-	 */
-	hdev->hw.mac.req_lane_num = 0;
 
 	hclge_parse_link_mode(hdev, cfg.speed_ability);
 
@@ -2629,7 +2634,7 @@ int hclge_cfg_mac_speed_dup(struct hclge_dev *hdev, int speed, u8 duplex, u8 lan
 	int ret;
 
 	duplex = hclge_check_speed_dup(duplex, speed);
-	if (!mac->support_autoneg && mac->speed == (u32)speed &&
+	if (!mac->support_autoneg && mac->speed == speed &&
 	    mac->duplex == duplex && (mac->lane_num == lane_num || lane_num == 0))
 		return 0;
 
@@ -2657,11 +2662,8 @@ static int hclge_cfg_mac_speed_dup_h(struct hnae3_handle *handle, int speed,
 	if (ret)
 		return ret;
 
-	hdev->hw.mac.req_lane_num = lane_num;
-	if (speed != SPEED_UNKNOWN)
-		hdev->hw.mac.req_speed = (u32)speed;
-	if (duplex != DUPLEX_UNKNOWN)
-		hdev->hw.mac.req_duplex = duplex;
+	hdev->hw.mac.req_speed = speed;
+	hdev->hw.mac.req_duplex = duplex;
 
 	return 0;
 }
@@ -2692,7 +2694,6 @@ static int hclge_set_autoneg(struct hnae3_handle *handle, bool enable)
 {
 	struct hclge_vport *vport = hclge_get_vport(handle);
 	struct hclge_dev *hdev = vport->back;
-	int ret;
 
 	if (!hdev->hw.mac.support_autoneg) {
 		if (enable) {
@@ -2704,10 +2705,7 @@ static int hclge_set_autoneg(struct hnae3_handle *handle, bool enable)
 		}
 	}
 
-	ret = hclge_set_autoneg_en(hdev, enable);
-	if (!ret)
-		hdev->hw.mac.req_autoneg = enable;
-	return ret;
+	return hclge_set_autoneg_en(hdev, enable);
 }
 
 static int hclge_get_autoneg(struct hnae3_handle *handle)
@@ -2968,6 +2966,20 @@ static int hclge_mac_init(struct hclge_dev *hdev)
 
 	if (!test_bit(HCLGE_STATE_RST_HANDLING, &hdev->state))
 		hdev->hw.mac.duplex = HCLGE_MAC_FULL;
+
+	if (hdev->hw.mac.support_autoneg) {
+		ret = hclge_set_autoneg_en(hdev, hdev->hw.mac.autoneg);
+		if (ret)
+			return ret;
+	}
+
+	if (!hdev->hw.mac.autoneg) {
+		ret = hclge_cfg_mac_speed_dup_hw(hdev, hdev->hw.mac.req_speed,
+						 hdev->hw.mac.req_duplex,
+						 hdev->hw.mac.lane_num);
+		if (ret)
+			return ret;
+	}
 
 	mac->link = 0;
 
@@ -3356,8 +3368,8 @@ static int hclge_get_phy_link_ksettings(struct hnae3_handle *handle,
 }
 
 static int
-hclge_ethtool_ksettings_set(struct hnae3_handle *handle,
-			    const struct ethtool_link_ksettings *cmd)
+hclge_set_phy_link_ksettings(struct hnae3_handle *handle,
+			     const struct ethtool_link_ksettings *cmd)
 {
 	struct hclge_desc desc[HCLGE_PHY_LINK_SETTING_BD_NUM];
 	struct hclge_vport *vport = hclge_get_vport(handle);
@@ -3398,34 +3410,10 @@ hclge_ethtool_ksettings_set(struct hnae3_handle *handle,
 		return ret;
 	}
 
-	linkmode_copy(hdev->hw.mac.advertising, cmd->link_modes.advertising);
-	return 0;
-}
-
-static int
-hclge_set_phy_link_ksettings(struct hnae3_handle *handle,
-			     const struct ethtool_link_ksettings *cmd)
-{
-	struct hclge_vport *vport = hclge_get_vport(handle);
-	struct hclge_dev *hdev = vport->back;
-	int ret = -ENODEV;
-
-	if (hnae3_dev_phy_imp_supported(hdev)) {
-		ret = hclge_ethtool_ksettings_set(handle, cmd);
-	} else if (handle->netdev->phydev) {
-		if (cmd->base.speed == SPEED_1000 &&
-		    cmd->base.autoneg == AUTONEG_DISABLE)
-			return -EINVAL;
-		ret = phy_ethtool_ksettings_set(handle->netdev->phydev, cmd);
-	}
-	if (ret)
-		return ret;
-
 	hdev->hw.mac.req_autoneg = cmd->base.autoneg;
-	if (cmd->base.speed != SPEED_UNKNOWN)
-		hdev->hw.mac.req_speed = cmd->base.speed;
-	if (cmd->base.duplex != DUPLEX_UNKNOWN)
-		hdev->hw.mac.req_duplex = cmd->base.duplex;
+	hdev->hw.mac.req_speed = cmd->base.speed;
+	hdev->hw.mac.req_duplex = cmd->base.duplex;
+	linkmode_copy(hdev->hw.mac.advertising, cmd->link_modes.advertising);
 
 	return 0;
 }
@@ -3468,7 +3456,7 @@ static int hclge_tp_port_init(struct hclge_dev *hdev)
 static int hclge_update_port_info(struct hclge_dev *hdev)
 {
 	struct hclge_mac *mac = &hdev->hw.mac;
-	u32 speed;
+	int speed;
 	int ret;
 
 	/* get the port info from SFP cmd if not copper port */
@@ -5701,20 +5689,18 @@ static int hclge_fd_ad_config(struct hclge_dev *hdev, u8 stage, int loc,
 		hnae3_set_field(ad_data, HCLGE_FD_AD_TC_SIZE_M,
 				HCLGE_FD_AD_TC_SIZE_S, (u32)action->tc_size);
 	}
-	hnae3_set_bit(ad_data, HCLGE_FD_AD_QID_H_B,
-		      action->queue_id >= HCLGE_TQP_MAX_SIZE_DEV_V2 ? 1 : 0);
 	ad_data <<= 32;
 	hnae3_set_bit(ad_data, HCLGE_FD_AD_DROP_B, action->drop_packet);
 	hnae3_set_bit(ad_data, HCLGE_FD_AD_DIRECT_QID_B,
 		      action->forward_to_direct_queue);
-	hnae3_set_field(ad_data, HCLGE_FD_AD_QID_L_M, HCLGE_FD_AD_QID_L_S,
+	hnae3_set_field(ad_data, HCLGE_FD_AD_QID_M, HCLGE_FD_AD_QID_S,
 			action->queue_id);
 	hnae3_set_bit(ad_data, HCLGE_FD_AD_USE_COUNTER_B, action->use_counter);
 	hnae3_set_field(ad_data, HCLGE_FD_AD_COUNTER_NUM_M,
 			HCLGE_FD_AD_COUNTER_NUM_S, action->counter_id);
 	hnae3_set_bit(ad_data, HCLGE_FD_AD_NXT_STEP_B, action->use_next_stage);
 	hnae3_set_field(ad_data, HCLGE_FD_AD_NXT_KEY_M, HCLGE_FD_AD_NXT_KEY_S,
-			action->next_input_key);
+			action->counter_id);
 
 	req->ad_data = cpu_to_le64(ad_data);
 	ret = hclge_cmd_send(&hdev->hw, &desc, 1);
@@ -7013,7 +6999,7 @@ static int hclge_get_all_rules(struct hnae3_handle *handle,
 	struct hclge_dev *hdev = vport->back;
 	struct hclge_fd_rule *rule;
 	struct hlist_node *node2;
-	u32 cnt = 0;
+	int cnt = 0;
 
 	if (!hnae3_ae_dev_fd_supported(hdev->ae_dev))
 		return -EOPNOTSUPP;
@@ -8024,7 +8010,7 @@ static int hclge_set_loopback(struct hnae3_handle *handle,
 	ret = hclge_tqp_enable(handle, en);
 	if (ret)
 		dev_err(&hdev->pdev->dev, "failed to %s tqp in loopback, ret = %d\n",
-			str_enable_disable(en), ret);
+			en ? "enable" : "disable", ret);
 
 	return ret;
 }
@@ -8247,14 +8233,14 @@ static int hclge_update_desc_vfid(struct hclge_desc *desc, int vfid, bool clr)
 		word_num = vfid / 32;
 		bit_num  = vfid % 32;
 		if (clr)
-			desc[1].data[word_num] &= cpu_to_le32(~(1U << bit_num));
+			desc[1].data[word_num] &= cpu_to_le32(~(1 << bit_num));
 		else
 			desc[1].data[word_num] |= cpu_to_le32(1 << bit_num);
 	} else {
 		word_num = (vfid - HCLGE_VF_NUM_IN_FIRST_DESC) / 32;
 		bit_num  = vfid % 32;
 		if (clr)
-			desc[2].data[word_num] &= cpu_to_le32(~(1U << bit_num));
+			desc[2].data[word_num] &= cpu_to_le32(~(1 << bit_num));
 		else
 			desc[2].data[word_num] |= cpu_to_le32(1 << bit_num);
 	}
@@ -9316,7 +9302,7 @@ static int hclge_add_mgr_tbl(struct hclge_dev *hdev,
 static int init_mgr_tbl(struct hclge_dev *hdev)
 {
 	int ret;
-	u32 i;
+	int i;
 
 	for (i = 0; i < ARRAY_SIZE(hclge_mgr_table); i++) {
 		ret = hclge_add_mgr_tbl(hdev, &hclge_mgr_table[i]);
@@ -9453,7 +9439,8 @@ static int hclge_mii_ioctl(struct hclge_dev *hdev, struct ifreq *ifr, int cmd)
 		/* this command reads phy id and register at the same time */
 		fallthrough;
 	case SIOCGMIIREG:
-		return hclge_read_phy_reg(hdev, data->reg_num, &data->val_out);
+		data->val_out = hclge_read_phy_reg(hdev, data->reg_num);
+		return 0;
 
 	case SIOCSMIIREG:
 		return hclge_write_phy_reg(hdev, data->reg_num, data->val_in);
@@ -9599,36 +9586,33 @@ static bool hclge_need_enable_vport_vlan_filter(struct hclge_vport *vport)
 	return false;
 }
 
-static int __hclge_enable_vport_vlan_filter(struct hclge_vport *vport,
-					    bool request_en)
-{
-	bool need_en;
-	int ret;
-
-	need_en = hclge_need_enable_vport_vlan_filter(vport);
-	if (need_en == vport->cur_vlan_fltr_en)
-		return 0;
-
-	ret = hclge_set_vport_vlan_filter(vport, need_en);
-	if (ret)
-		return ret;
-
-	vport->cur_vlan_fltr_en = need_en;
-
-	return 0;
-}
-
 int hclge_enable_vport_vlan_filter(struct hclge_vport *vport, bool request_en)
 {
 	struct hclge_dev *hdev = vport->back;
+	bool need_en;
 	int ret;
 
 	mutex_lock(&hdev->vport_lock);
+
 	vport->req_vlan_fltr_en = request_en;
-	ret = __hclge_enable_vport_vlan_filter(vport, request_en);
+
+	need_en = hclge_need_enable_vport_vlan_filter(vport);
+	if (need_en == vport->cur_vlan_fltr_en) {
+		mutex_unlock(&hdev->vport_lock);
+		return 0;
+	}
+
+	ret = hclge_set_vport_vlan_filter(vport, need_en);
+	if (ret) {
+		mutex_unlock(&hdev->vport_lock);
+		return ret;
+	}
+
+	vport->cur_vlan_fltr_en = need_en;
+
 	mutex_unlock(&hdev->vport_lock);
 
-	return ret;
+	return 0;
 }
 
 static int hclge_enable_vlan_filter(struct hnae3_handle *handle, bool enable)
@@ -10586,9 +10570,6 @@ int hclge_set_vlan_filter(struct hnae3_handle *handle, __be16 proto,
 	bool writen_to_tbl = false;
 	int ret = 0;
 
-	if (vlan_id >= VLAN_N_VID)
-		return -EINVAL;
-
 	/* When device is resetting or reset failed, firmware is unable to
 	 * handle mailbox. Just record the vlan id, and remove it after
 	 * reset finished.
@@ -10652,19 +10633,16 @@ static void hclge_sync_vlan_fltr_state(struct hclge_dev *hdev)
 					&vport->state))
 			continue;
 
-		mutex_lock(&hdev->vport_lock);
-		ret = __hclge_enable_vport_vlan_filter(vport,
-						       vport->req_vlan_fltr_en);
+		ret = hclge_enable_vport_vlan_filter(vport,
+						     vport->req_vlan_fltr_en);
 		if (ret) {
 			dev_err(&hdev->pdev->dev,
 				"failed to sync vlan filter state for vport%u, ret = %d\n",
 				vport->vport_id, ret);
 			set_bit(HCLGE_VPORT_STATE_VLAN_FLTR_CHANGE,
 				&vport->state);
-			mutex_unlock(&hdev->vport_lock);
 			return;
 		}
-		mutex_unlock(&hdev->vport_lock);
 	}
 }
 
@@ -10745,7 +10723,7 @@ int hclge_set_vport_mtu(struct hclge_vport *vport, int new_mtu)
 	max_frm_size = max(max_frm_size, HCLGE_MAC_DEFAULT_FRAME);
 	mutex_lock(&hdev->vport_lock);
 	/* VF's mps must fit within hdev->mps */
-	if (vport->vport_id && (u32)max_frm_size > hdev->mps) {
+	if (vport->vport_id && max_frm_size > hdev->mps) {
 		mutex_unlock(&hdev->vport_lock);
 		return -EINVAL;
 	} else if (vport->vport_id) {
@@ -10756,7 +10734,7 @@ int hclge_set_vport_mtu(struct hclge_vport *vport, int new_mtu)
 
 	/* PF's mps must be greater then VF's mps */
 	for (i = 1; i < hdev->num_alloc_vport; i++)
-		if ((u32)max_frm_size < hdev->vport[i].mps) {
+		if (max_frm_size < hdev->vport[i].mps) {
 			dev_err(&hdev->pdev->dev,
 				"failed to set pf mtu for less than vport %d, mps = %u.\n",
 				i, hdev->vport[i].mps);
@@ -11232,9 +11210,9 @@ static void hclge_info_show(struct hclge_dev *hdev)
 	dev_info(dev, "This is %s PF\n",
 		 hdev->flag & HCLGE_FLAG_MAIN ? "main" : "not main");
 	dev_info(dev, "DCB %s\n",
-		 str_enable_disable(handle->kinfo.tc_info.dcb_ets_active));
+		 handle->kinfo.tc_info.dcb_ets_active ? "enable" : "disable");
 	dev_info(dev, "MQPRIO %s\n",
-		 str_enable_disable(handle->kinfo.tc_info.mqprio_active));
+		 handle->kinfo.tc_info.mqprio_active ? "enable" : "disable");
 	dev_info(dev, "Default tx spare buffer size: %u\n",
 		 hdev->tx_spare_buf_size);
 
@@ -11246,7 +11224,7 @@ static int hclge_init_nic_client_instance(struct hnae3_ae_dev *ae_dev,
 {
 	struct hnae3_client *client = vport->nic.client;
 	struct hclge_dev *hdev = ae_dev->priv;
-	u32 rst_cnt = hdev->rst_stats.reset_cnt;
+	int rst_cnt = hdev->rst_stats.reset_cnt;
 	int ret;
 
 	ret = client->ops->init_instance(&vport->nic);
@@ -11290,7 +11268,7 @@ static int hclge_init_roce_client_instance(struct hnae3_ae_dev *ae_dev,
 {
 	struct hclge_dev *hdev = ae_dev->priv;
 	struct hnae3_client *client;
-	u32 rst_cnt;
+	int rst_cnt;
 	int ret;
 
 	if (!hnae3_dev_roce_supported(hdev) || !hdev->roce_client ||
@@ -11748,27 +11726,6 @@ static int hclge_set_wol(struct hnae3_handle *handle,
 	return ret;
 }
 
-static int hclge_set_autoneg_speed_dup(struct hclge_dev *hdev)
-{
-	int ret;
-
-	if (hdev->hw.mac.support_autoneg) {
-		ret = hclge_set_autoneg_en(hdev, hdev->hw.mac.req_autoneg);
-		if (ret)
-			return ret;
-	}
-
-	if (!hdev->hw.mac.req_autoneg) {
-		ret = hclge_cfg_mac_speed_dup_hw(hdev, hdev->hw.mac.req_speed,
-						 hdev->hw.mac.req_duplex,
-						 hdev->hw.mac.req_lane_num);
-		if (ret)
-			return ret;
-	}
-
-	return 0;
-}
-
 static int hclge_init_ae_dev(struct hnae3_ae_dev *ae_dev)
 {
 	struct pci_dev *pdev = ae_dev->pdev;
@@ -11930,20 +11887,6 @@ static int hclge_init_ae_dev(struct hnae3_ae_dev *ae_dev)
 	if (ret)
 		goto err_ptp_uninit;
 
-	if (hdev->hw.mac.media_type != HNAE3_MEDIA_TYPE_COPPER) {
-		hdev->hw.mac.req_autoneg = hdev->hw.mac.autoneg;
-		if (hdev->hw.mac.autoneg == AUTONEG_DISABLE &&
-		    hdev->hw.mac.speed != SPEED_UNKNOWN)
-			hdev->hw.mac.req_speed = hdev->hw.mac.speed;
-	}
-
-	ret = hclge_set_autoneg_speed_dup(hdev);
-	if (ret) {
-		dev_err(&pdev->dev,
-			"failed to set autoneg speed duplex, ret = %d\n", ret);
-		goto err_ptp_uninit;
-	}
-
 	INIT_KFIFO(hdev->mac_tnl_log);
 
 	hclge_dcb_ops_set(hdev);
@@ -12043,7 +11986,7 @@ static int hclge_set_vf_spoofchk_hw(struct hclge_dev *hdev, int vf, bool enable)
 	if (ret) {
 		dev_err(&hdev->pdev->dev,
 			"Set vf %d mac spoof check %s failed, ret=%d\n",
-			vf, str_on_off(enable), ret);
+			vf, enable ? "on" : "off", ret);
 		return ret;
 	}
 
@@ -12051,7 +11994,7 @@ static int hclge_set_vf_spoofchk_hw(struct hclge_dev *hdev, int vf, bool enable)
 	if (ret)
 		dev_err(&hdev->pdev->dev,
 			"Set vf %d vlan spoof check %s failed, ret=%d\n",
-			vf, str_on_off(enable), ret);
+			vf, enable ? "on" : "off", ret);
 
 	return ret;
 }
@@ -12155,7 +12098,7 @@ static int hclge_vf_rate_param_check(struct hclge_dev *hdev,
 				     int min_tx_rate, int max_tx_rate)
 {
 	if (min_tx_rate != 0 ||
-	    max_tx_rate < 0 || (u32)max_tx_rate > hdev->hw.mac.max_speed) {
+	    max_tx_rate < 0 || max_tx_rate > hdev->hw.mac.max_speed) {
 		dev_err(&hdev->pdev->dev,
 			"min_tx_rate:%d [0], max_tx_rate:%d [0, %u]\n",
 			min_tx_rate, max_tx_rate, hdev->hw.mac.max_speed);
@@ -12180,7 +12123,7 @@ static int hclge_set_vf_rate(struct hnae3_handle *handle, int vf,
 	if (!vport)
 		return -EINVAL;
 
-	if (!force && (u32)max_tx_rate == vport->vf_info.max_tx_rate)
+	if (!force && max_tx_rate == vport->vf_info.max_tx_rate)
 		return 0;
 
 	ret = hclge_tm_qs_shaper_cfg(vport, max_tx_rate);
@@ -12271,13 +12214,6 @@ static int hclge_reset_ae_dev(struct hnae3_ae_dev *ae_dev)
 	ret = hclge_mac_init(hdev);
 	if (ret) {
 		dev_err(&pdev->dev, "Mac init error, ret = %d\n", ret);
-		return ret;
-	}
-
-	ret = hclge_set_autoneg_speed_dup(hdev);
-	if (ret) {
-		dev_err(&pdev->dev,
-			"failed to set autoneg speed duplex, ret = %d\n", ret);
 		return ret;
 	}
 

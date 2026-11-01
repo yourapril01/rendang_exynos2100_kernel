@@ -24,10 +24,12 @@
 #include <linux/device.h>
 #include <linux/cdev.h>
 #include "input-compat.h"
+#include <linux/export.h>
 
 struct evdev {
 	int open;
 	struct input_handle handle;
+	wait_queue_head_t wait;
 	struct evdev_client __rcu *grab;
 	struct list_head client_list;
 	spinlock_t client_lock; /* protects client_list */
@@ -42,7 +44,6 @@ struct evdev_client {
 	unsigned int tail;
 	unsigned int packet_head; /* [future] position of the first element of next packet */
 	spinlock_t buffer_lock; /* protects access to buffer, head and tail */
-	wait_queue_head_t wait;
 	struct fasync_struct *fasync;
 	struct evdev *evdev;
 	struct list_head node;
@@ -50,8 +51,38 @@ struct evdev_client {
 	bool revoked;
 	unsigned long *evmasks[EV_CNT];
 	unsigned int bufsize;
-	struct input_event buffer[] __counted_by(bufsize);
+	struct input_event buffer[];
 };
+
+#if IS_ENABLED(CONFIG_SEC_INPUT_BOOSTER)
+#include <linux/notifier.h>
+#include <linux/input/input_booster.h>
+
+struct workqueue_struct *ib_unbound_highwq;
+spinlock_t ib_idx_lock;
+struct ib_event_work *ib_evt_work;
+int ib_work_cnt;
+
+static BLOCKING_NOTIFIER_HEAD(ib_notifier_list);
+
+int ib_notifier_register(struct notifier_block *nb)
+{
+	return blocking_notifier_chain_register(&ib_notifier_list, nb);
+}
+EXPORT_SYMBOL(ib_notifier_register);
+
+int ib_notifier_unregister(struct notifier_block *nb)
+{
+	return blocking_notifier_chain_unregister(&ib_notifier_list, nb);
+}
+EXPORT_SYMBOL(ib_notifier_unregister);
+
+int ib_notifier_call_chain(unsigned long val, void *v)
+{
+	return blocking_notifier_call_chain(&ib_notifier_list, val, v);
+}
+EXPORT_SYMBOL_GPL(ib_notifier_call_chain);
+#endif
 
 static size_t evdev_get_mask_cnt(unsigned int type)
 {
@@ -245,6 +276,7 @@ static void evdev_pass_values(struct evdev_client *client,
 			const struct input_value *vals, unsigned int count,
 			ktime_t *ev_time)
 {
+	struct evdev *evdev = client->evdev;
 	const struct input_value *v;
 	struct input_event event;
 	struct timespec64 ts;
@@ -281,19 +313,49 @@ static void evdev_pass_values(struct evdev_client *client,
 	spin_unlock(&client->buffer_lock);
 
 	if (wakeup)
-		wake_up_interruptible_poll(&client->wait,
-			EPOLLIN | EPOLLOUT | EPOLLRDNORM | EPOLLWRNORM);
+		wake_up_interruptible(&evdev->wait);
 }
+
+#if IS_ENABLED(CONFIG_SEC_INPUT_BOOSTER)
+static void evdev_ib_trigger(struct work_struct* work)
+{
+	struct ib_event_work *ib_work = container_of(work, struct ib_event_work, evdev_work);
+	struct ib_event_data ib_data;
+
+	ib_data.evt_cnt = ib_work->evt_cnt;
+	ib_data.vals = ib_work->vals;
+	ib_notifier_call_chain(IB_EVENT_TOUCH_BOOSTER, &(ib_data));
+}
+#endif
 
 /*
  * Pass incoming events to all connected clients.
  */
-static unsigned int evdev_events(struct input_handle *handle,
-				 struct input_value *vals, unsigned int count)
+static void evdev_events(struct input_handle *handle,
+			 const struct input_value *vals, unsigned int count)
 {
 	struct evdev *evdev = handle->private;
 	struct evdev_client *client;
+#if IS_ENABLED(CONFIG_SEC_INPUT_BOOSTER)
+	int cur_ib_idx;
+#endif
 	ktime_t *ev_time = input_get_timestamp(handle->dev);
+
+#if IS_ENABLED(CONFIG_SEC_INPUT_BOOSTER)
+	spin_lock(&ib_idx_lock);
+	cur_ib_idx = ib_work_cnt++;
+	if (ib_work_cnt >= MAX_IB_COUNT) {
+		pr_info("[Input Booster] Ib_Work_Cnt(%d), Event_Cnt(%d)", ib_work_cnt, count);
+		ib_work_cnt = 0;
+	}
+
+	if (ib_evt_work != NULL) {
+		ib_evt_work[cur_ib_idx].evt_cnt = count;
+		memcpy(ib_evt_work[cur_ib_idx].vals, vals, sizeof(struct input_value) * count);
+		queue_work(ib_unbound_highwq, &(ib_evt_work[cur_ib_idx].evdev_work));
+	}
+	spin_unlock(&ib_idx_lock);
+#endif
 
 	rcu_read_lock();
 
@@ -306,8 +368,17 @@ static unsigned int evdev_events(struct input_handle *handle,
 			evdev_pass_values(client, vals, count, ev_time);
 
 	rcu_read_unlock();
+}
 
-	return count;
+/*
+ * Pass incoming event to all connected clients.
+ */
+static void evdev_event(struct input_handle *handle,
+			unsigned int type, unsigned int code, int value)
+{
+	struct input_value vals[] = { { type, code, value } };
+
+	evdev_events(handle, vals, 1);
 }
 
 static int evdev_fasync(int fd, struct file *file, int on)
@@ -416,11 +487,11 @@ static void evdev_hangup(struct evdev *evdev)
 	struct evdev_client *client;
 
 	spin_lock(&evdev->client_lock);
-	list_for_each_entry(client, &evdev->client_list, node) {
+	list_for_each_entry(client, &evdev->client_list, node)
 		kill_fasync(&client->fasync, SIGIO, POLL_HUP);
-		wake_up_interruptible_poll(&client->wait, EPOLLHUP | EPOLLERR);
-	}
 	spin_unlock(&evdev->client_lock);
+
+	wake_up_interruptible(&evdev->wait);
 }
 
 static int evdev_release(struct inode *inode, struct file *file)
@@ -469,7 +540,6 @@ static int evdev_open(struct inode *inode, struct file *file)
 	if (!client)
 		return -ENOMEM;
 
-	init_waitqueue_head(&client->wait);
 	client->bufsize = bufsize;
 	spin_lock_init(&client->buffer_lock);
 	client->evdev = evdev;
@@ -497,13 +567,6 @@ static ssize_t evdev_write(struct file *file, const char __user *buffer,
 	struct evdev *evdev = client->evdev;
 	struct input_event event;
 	int retval = 0;
-
-	/*
-	 * Limit amount of data we inject into the input subsystem so that
-	 * we do not hold evdev->mutex for too long. 4096 bytes corresponds
-	 * to 170 input events.
-	 */
-	count = min(count, 4096);
 
 	if (count != 0 && count < input_event_size())
 		return -EINVAL;
@@ -593,7 +656,7 @@ static ssize_t evdev_read(struct file *file, char __user *buffer,
 			break;
 
 		if (!(file->f_flags & O_NONBLOCK)) {
-			error = wait_event_interruptible(client->wait,
+			error = wait_event_interruptible(evdev->wait,
 					client->packet_head != client->tail ||
 					!evdev->exist || client->revoked);
 			if (error)
@@ -611,7 +674,7 @@ static __poll_t evdev_poll(struct file *file, poll_table *wait)
 	struct evdev *evdev = client->evdev;
 	__poll_t mask;
 
-	poll_wait(file, &client->wait, wait);
+	poll_wait(file, &evdev->wait, wait);
 
 	if (evdev->exist && !client->revoked)
 		mask = EPOLLOUT | EPOLLWRNORM;
@@ -944,7 +1007,7 @@ static int evdev_revoke(struct evdev *evdev, struct evdev_client *client,
 	client->revoked = true;
 	evdev_ungrab(evdev, client);
 	input_flush_device(&evdev->handle, file);
-	wake_up_interruptible_poll(&client->wait, EPOLLHUP | EPOLLERR);
+	wake_up_interruptible(&evdev->wait);
 
 	return 0;
 }
@@ -1299,6 +1362,7 @@ static const struct file_operations evdev_fops = {
 	.compat_ioctl	= evdev_ioctl_compat,
 #endif
 	.fasync		= evdev_fasync,
+	.llseek		= no_llseek,
 };
 
 /*
@@ -1355,6 +1419,7 @@ static int evdev_connect(struct input_handler *handler, struct input_dev *dev,
 	INIT_LIST_HEAD(&evdev->client_list);
 	spin_lock_init(&evdev->client_lock);
 	mutex_init(&evdev->mutex);
+	init_waitqueue_head(&evdev->wait);
 	evdev->exist = true;
 
 	dev_no = minor;
@@ -1415,6 +1480,7 @@ static const struct input_device_id evdev_ids[] = {
 MODULE_DEVICE_TABLE(input, evdev_ids);
 
 static struct input_handler evdev_handler = {
+	.event		= evdev_event,
 	.events		= evdev_events,
 	.connect	= evdev_connect,
 	.disconnect	= evdev_disconnect,
@@ -1426,6 +1492,18 @@ static struct input_handler evdev_handler = {
 
 static int __init evdev_init(void)
 {
+#if IS_ENABLED(CONFIG_SEC_INPUT_BOOSTER)
+	int i;
+	ib_evt_work = kmalloc(sizeof(struct ib_event_work) * MAX_IB_COUNT, GFP_KERNEL);
+	if (ib_evt_work != NULL) {
+		for (i = 0; i < MAX_IB_COUNT; i++)
+			INIT_WORK(&(ib_evt_work[i].evdev_work), evdev_ib_trigger);
+	}
+	ib_work_cnt = 0;
+	spin_lock_init(&ib_idx_lock);
+	ib_unbound_highwq =
+		alloc_ordered_workqueue("ib_unbound_highwq", WQ_HIGHPRI);
+#endif
 	return input_register_handler(&evdev_handler);
 }
 

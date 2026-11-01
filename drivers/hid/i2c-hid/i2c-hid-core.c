@@ -280,7 +280,6 @@ static int i2c_hid_get_report(struct i2c_hid *ihid,
 	 * In addition to report data device will supply data length
 	 * in the first 2 bytes of the response, so adjust .
 	 */
-	recv_len = min(recv_len, ihid->bufsize - sizeof(__le16));
 	error = i2c_hid_xfer(ihid, ihid->cmdbuf, length,
 			     ihid->rawbuf, recv_len + sizeof(__le16));
 	if (error) {
@@ -568,10 +567,9 @@ static void i2c_hid_get_input(struct i2c_hid *ihid)
 		if (ihid->hid->group != HID_GROUP_RMI)
 			pm_wakeup_event(&ihid->client->dev, 0);
 
-		hid_safe_input_report(ihid->hid, HID_INPUT_REPORT,
-				      ihid->inbuf + sizeof(__le16),
-				      ihid->bufsize - sizeof(__le16),
-				      ret_size - sizeof(__le16), 1);
+		hid_input_report(ihid->hid, HID_INPUT_REPORT,
+				ihid->inbuf + sizeof(__le16),
+				ret_size - sizeof(__le16), 1);
 	}
 
 	return;
@@ -957,14 +955,6 @@ static void i2c_hid_core_shutdown_tail(struct i2c_hid *ihid)
 	ihid->ops->shutdown_tail(ihid->ops);
 }
 
-static void i2c_hid_core_restore_sequence(struct i2c_hid *ihid)
-{
-	if (!ihid->ops->restore_sequence)
-		return;
-
-	ihid->ops->restore_sequence(ihid->ops);
-}
-
 static int i2c_hid_core_suspend(struct i2c_hid *ihid, bool force_poweroff)
 {
 	struct i2c_client *client = ihid->client;
@@ -1331,16 +1321,7 @@ void i2c_hid_core_shutdown(struct i2c_client *client)
 {
 	struct i2c_hid *ihid = i2c_get_clientdata(client);
 
-	/*
-	 * Like in i2c_hid_core_remove(): if we're a follower, the act of
-	 * unfollowing will cause us to be powered down. Otherwise we need to
-	 * manually do it.
-	 */
-	if (ihid->is_panel_follower)
-		drm_panel_remove_follower(&ihid->panel_follower);
-	else
-		i2c_hid_set_power(ihid, I2C_HID_PWR_SLEEP);
-
+	i2c_hid_set_power(ihid, I2C_HID_PWR_SLEEP);
 	free_irq(client->irq, ihid);
 
 	i2c_hid_core_shutdown_tail(ihid);
@@ -1369,26 +1350,8 @@ static int i2c_hid_core_pm_resume(struct device *dev)
 	return i2c_hid_core_resume(ihid);
 }
 
-static int i2c_hid_core_pm_restore(struct device *dev)
-{
-	struct i2c_client *client = to_i2c_client(dev);
-	struct i2c_hid *ihid = i2c_get_clientdata(client);
-
-	if (ihid->is_panel_follower)
-		return 0;
-
-	i2c_hid_core_restore_sequence(ihid);
-
-	return i2c_hid_core_resume(ihid);
-}
-
 const struct dev_pm_ops i2c_hid_core_pm = {
-	.suspend = pm_sleep_ptr(i2c_hid_core_pm_suspend),
-	.resume = pm_sleep_ptr(i2c_hid_core_pm_resume),
-	.freeze = pm_sleep_ptr(i2c_hid_core_pm_suspend),
-	.thaw = pm_sleep_ptr(i2c_hid_core_pm_resume),
-	.poweroff = pm_sleep_ptr(i2c_hid_core_pm_suspend),
-	.restore = pm_sleep_ptr(i2c_hid_core_pm_restore),
+	SYSTEM_SLEEP_PM_OPS(i2c_hid_core_pm_suspend, i2c_hid_core_pm_resume)
 };
 EXPORT_SYMBOL_GPL(i2c_hid_core_pm);
 

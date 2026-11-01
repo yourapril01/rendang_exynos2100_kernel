@@ -33,61 +33,7 @@
 #include <linux/sched/mm.h>
 #include <linux/statfs.h>
 #include <linux/uaccess.h>
-#include <linux/blk-mq.h>
-#include <linux/spinlock.h>
-#include <uapi/linux/loop.h>
-
-/* Possible states of device */
-enum {
-	Lo_unbound,
-	Lo_bound,
-	Lo_rundown,
-	Lo_deleting,
-};
-
-struct loop_func_table;
-
-struct loop_device {
-	int		lo_number;
-	loff_t		lo_offset;
-	loff_t		lo_sizelimit;
-	int		lo_flags;
-	char		lo_file_name[LO_NAME_SIZE];
-
-	struct file *	lo_backing_file;
-	struct block_device *lo_device;
-
-	gfp_t		old_gfp_mask;
-
-	spinlock_t		lo_lock;
-	int			lo_state;
-	spinlock_t              lo_work_lock;
-	struct workqueue_struct *workqueue;
-	struct work_struct      rootcg_work;
-	struct list_head        rootcg_cmd_list;
-	struct list_head        idle_worker_list;
-	struct rb_root          worker_tree;
-	struct timer_list       timer;
-	bool			use_dio;
-	bool			sysfs_inited;
-
-	struct request_queue	*lo_queue;
-	struct blk_mq_tag_set	tag_set;
-	struct gendisk		*lo_disk;
-	struct mutex		lo_mutex;
-	bool			idr_visible;
-};
-
-struct loop_cmd {
-	struct list_head list_entry;
-	bool use_aio; /* use AIO interface to handle I/O */
-	atomic_t ref; /* only for aio */
-	long ret;
-	struct kiocb iocb;
-	struct bio_vec *bvec;
-	struct cgroup_subsys_state *blkcg_css;
-	struct cgroup_subsys_state *memcg_css;
-};
+#include <linux/loop.h>
 
 #define LOOP_IDLE_WORKER_TIMEOUT (60 * HZ)
 #define LOOP_DEFAULT_HW_Q_DEPTH 128
@@ -330,13 +276,14 @@ end_io:
 static void lo_rw_aio_do_completion(struct loop_cmd *cmd)
 {
 	struct request *rq = blk_mq_rq_from_pdu(cmd);
+	struct loop_device *lo = rq->q->queuedata;
 
 	if (!atomic_dec_and_test(&cmd->ref))
 		return;
 	kfree(cmd->bvec);
 	cmd->bvec = NULL;
 	if (req_op(rq) == REQ_OP_WRITE)
-		kiocb_end_write(&cmd->iocb);
+		file_end_write(lo->lo_backing_file);
 	if (likely(!blk_should_fake_timeout(rq->q)))
 		blk_mq_complete_request(rq);
 }
@@ -412,7 +359,7 @@ static int lo_rw_aio(struct loop_device *lo, struct loop_cmd *cmd,
 	}
 
 	if (rw == ITER_SOURCE) {
-		kiocb_start_write(&cmd->iocb);
+		file_start_write(lo->lo_backing_file);
 		ret = file->f_op->write_iter(&cmd->iocb, &iter);
 	} else
 		ret = file->f_op->read_iter(&cmd->iocb, &iter);
@@ -543,10 +490,8 @@ static int loop_change_fd(struct loop_device *lo, struct block_device *bdev,
 		return -EBADF;
 
 	error = loop_check_backing_file(file);
-	if (error) {
-		fput(file);
+	if (error)
 		return error;
-	}
 
 	/* suppress uevents while reconfiguring the device */
 	dev_set_uevent_suppress(disk_to_dev(lo->lo_disk), 1);
@@ -982,10 +927,8 @@ static int loop_configure(struct loop_device *lo, blk_mode_t mode,
 		return -EBADF;
 
 	error = loop_check_backing_file(file);
-	if (error) {
-		fput(file);
+	if (error)
 		return error;
-	}
 
 	is_loop = is_loop_device(file);
 
@@ -1421,33 +1364,16 @@ static int loop_set_dio(struct loop_device *lo, unsigned long arg)
 	return error;
 }
 
-static int loop_set_block_size(struct loop_device *lo, blk_mode_t mode,
-			       struct block_device *bdev, unsigned long arg)
+static int loop_set_block_size(struct loop_device *lo, unsigned long arg)
 {
 	struct queue_limits lim;
 	int err = 0;
 
-	/*
-	 * If we don't hold exclusive handle for the device, upgrade to it
-	 * here to avoid changing device under exclusive owner.
-	 */
-	if (!(mode & BLK_OPEN_EXCL)) {
-		err = bd_prepare_to_claim(bdev, loop_set_block_size, NULL);
-		if (err)
-			return err;
-	}
-
-	err = mutex_lock_killable(&lo->lo_mutex);
-	if (err)
-		goto abort_claim;
-
-	if (lo->lo_state != Lo_bound) {
-		err = -ENXIO;
-		goto unlock;
-	}
+	if (lo->lo_state != Lo_bound)
+		return -ENXIO;
 
 	if (lo->lo_queue->limits.logical_block_size == arg)
-		goto unlock;
+		return 0;
 
 	sync_blockdev(lo->lo_device);
 	invalidate_bdev(lo->lo_device);
@@ -1460,11 +1386,6 @@ static int loop_set_block_size(struct loop_device *lo, blk_mode_t mode,
 	loop_update_dio(lo);
 	blk_mq_unfreeze_queue(lo->lo_queue);
 
-unlock:
-	mutex_unlock(&lo->lo_mutex);
-abort_claim:
-	if (!(mode & BLK_OPEN_EXCL))
-		bd_abort_claiming(bdev, loop_set_block_size);
 	return err;
 }
 
@@ -1482,6 +1403,9 @@ static int lo_simple_ioctl(struct loop_device *lo, unsigned int cmd,
 		break;
 	case LOOP_SET_DIRECT_IO:
 		err = loop_set_dio(lo, arg);
+		break;
+	case LOOP_SET_BLOCK_SIZE:
+		err = loop_set_block_size(lo, arg);
 		break;
 	default:
 		err = -EINVAL;
@@ -1537,12 +1461,9 @@ static int lo_ioctl(struct block_device *bdev, blk_mode_t mode,
 		break;
 	case LOOP_GET_STATUS64:
 		return loop_get_status64(lo, argp);
-	case LOOP_SET_BLOCK_SIZE:
-		if (!(mode & BLK_OPEN_WRITE) && !capable(CAP_SYS_ADMIN))
-			return -EPERM;
-		return loop_set_block_size(lo, mode, bdev, arg);
 	case LOOP_SET_CAPACITY:
 	case LOOP_SET_DIRECT_IO:
+	case LOOP_SET_BLOCK_SIZE:
 		if (!(mode & BLK_OPEN_WRITE) && !capable(CAP_SYS_ADMIN))
 			return -EPERM;
 		fallthrough;

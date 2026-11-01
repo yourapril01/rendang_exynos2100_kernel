@@ -9,6 +9,7 @@
 #include <linux/iio/consumer.h>
 #include <linux/iio/types.h>
 #include <linux/input.h>
+#include <linux/input-polldev.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/of.h>
@@ -29,9 +30,9 @@ struct adc_keys_state {
 	const struct adc_keys_button *map;
 };
 
-static void adc_keys_poll(struct input_dev *input)
+static void adc_keys_poll(struct input_polled_dev *dev)
 {
-	struct adc_keys_state *st = input_get_drvdata(input);
+	struct adc_keys_state *st = dev->private;
 	int i, value, ret;
 	u32 diff, closest = 0xffffffff;
 	int keycode = 0;
@@ -54,18 +55,19 @@ static void adc_keys_poll(struct input_dev *input)
 		keycode = 0;
 
 	if (st->last_key && st->last_key != keycode)
-		input_report_key(input, st->last_key, 0);
+		input_report_key(dev->input, st->last_key, 0);
 
 	if (keycode)
-		input_report_key(input, keycode, 1);
+		input_report_key(dev->input, keycode, 1);
 
-	input_sync(input);
+	input_sync(dev->input);
 	st->last_key = keycode;
 }
 
 static int adc_keys_load_keymap(struct device *dev, struct adc_keys_state *st)
 {
 	struct adc_keys_button *map;
+	struct fwnode_handle *child;
 	int i;
 
 	st->num_keys = device_get_child_node_count(dev);
@@ -79,10 +81,11 @@ static int adc_keys_load_keymap(struct device *dev, struct adc_keys_state *st)
 		return -ENOMEM;
 
 	i = 0;
-	device_for_each_child_node_scoped(dev, child) {
+	device_for_each_child_node(dev, child) {
 		if (fwnode_property_read_u32(child, "press-threshold-microvolt",
 					     &map[i].voltage)) {
 			dev_err(dev, "Key with invalid or missing voltage\n");
+			fwnode_handle_put(child);
 			return -EINVAL;
 		}
 		map[i].voltage /= 1000;
@@ -90,6 +93,7 @@ static int adc_keys_load_keymap(struct device *dev, struct adc_keys_state *st)
 		if (fwnode_property_read_u32(child, "linux,code",
 					     &map[i].keycode)) {
 			dev_err(dev, "Key with invalid or missing linux,code\n");
+			fwnode_handle_put(child);
 			return -EINVAL;
 		}
 
@@ -104,6 +108,7 @@ static int adc_keys_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	struct adc_keys_state *st;
+	struct input_polled_dev *poll_dev;
 	struct input_dev *input;
 	enum iio_chan_type type;
 	int i, value;
@@ -140,13 +145,19 @@ static int adc_keys_probe(struct platform_device *pdev)
 	if (error)
 		return error;
 
-	input = devm_input_allocate_device(dev);
-	if (!input) {
+	poll_dev = devm_input_allocate_polled_device(dev);
+	if (!poll_dev) {
 		dev_err(dev, "failed to allocate input device\n");
 		return -ENOMEM;
 	}
 
-	input_set_drvdata(input, st);
+	if (!device_property_read_u32(dev, "poll-interval", &value))
+		poll_dev->poll_interval = value;
+
+	poll_dev->poll = adc_keys_poll;
+	poll_dev->private = st;
+
+	input = poll_dev->input;
 
 	input->name = pdev->name;
 	input->phys = "adc-keys/input0";
@@ -163,17 +174,7 @@ static int adc_keys_probe(struct platform_device *pdev)
 	if (device_property_read_bool(dev, "autorepeat"))
 		__set_bit(EV_REP, input->evbit);
 
-
-	error = input_setup_polling(input, adc_keys_poll);
-	if (error) {
-		dev_err(dev, "Unable to set up polling: %d\n", error);
-		return error;
-	}
-
-	if (!device_property_read_u32(dev, "poll-interval", &value))
-		input_set_poll_interval(input, value);
-
-	error = input_register_device(input);
+	error = input_register_polled_device(poll_dev);
 	if (error) {
 		dev_err(dev, "Unable to register input device: %d\n", error);
 		return error;
@@ -190,7 +191,7 @@ static const struct of_device_id adc_keys_of_match[] = {
 MODULE_DEVICE_TABLE(of, adc_keys_of_match);
 #endif
 
-static struct platform_driver adc_keys_driver = {
+static struct platform_driver __refdata adc_keys_driver = {
 	.driver = {
 		.name = "adc_keys",
 		.of_match_table = of_match_ptr(adc_keys_of_match),

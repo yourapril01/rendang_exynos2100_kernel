@@ -283,9 +283,9 @@ static void tonga_ih_set_rptr(struct amdgpu_device *adev,
 	}
 }
 
-static int tonga_ih_early_init(struct amdgpu_ip_block *ip_block)
+static int tonga_ih_early_init(void *handle)
 {
-	struct amdgpu_device *adev = ip_block->adev;
+	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
 	int ret;
 
 	ret = amdgpu_irq_add_domain(adev);

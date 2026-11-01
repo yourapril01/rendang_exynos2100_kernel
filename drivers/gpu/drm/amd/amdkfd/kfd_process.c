@@ -1970,7 +1970,7 @@ static int signal_eviction_fence(struct kfd_process *p)
 	ef = dma_fence_get_rcu_safe(&p->ef);
 	rcu_read_unlock();
 	if (!ef)
-		return true;
+		return -EINVAL;
 
 	ret = dma_fence_signal(ef);
 	dma_fence_put(ef);

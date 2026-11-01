@@ -545,8 +545,7 @@ static int abx80x_ioctl(struct device *dev, unsigned int cmd, unsigned long arg)
 
 		status &= ~ABX8XX_STATUS_BLF;
 
-		tmp = i2c_smbus_write_byte_data(client, ABX8XX_REG_STATUS,
-						status);
+		tmp = i2c_smbus_write_byte_data(client, ABX8XX_REG_STATUS, 0);
 		if (tmp < 0)
 			return tmp;
 
@@ -934,8 +933,6 @@ static int abx80x_probe(struct i2c_client *client)
 			client->irq = 0;
 		}
 	}
-	if (client->irq <= 0)
-		clear_bit(RTC_FEATURE_ALARM, priv->rtc->features);
 
 	err = rtc_add_group(priv->rtc, &rtc_calib_attr_group);
 	if (err) {

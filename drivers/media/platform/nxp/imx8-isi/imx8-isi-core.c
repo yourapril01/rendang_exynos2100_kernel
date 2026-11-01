@@ -472,14 +472,13 @@ static int mxc_isi_probe(struct platform_device *pdev)
 		return ret;
 	}
 
-	ret = devm_pm_runtime_enable(dev);
-	if (ret)
-		return ret;
+	pm_runtime_enable(dev);
 
 	ret = mxc_isi_crossbar_init(isi);
-	if (ret)
-		return dev_err_probe(dev, ret,
-				     "Failed to initialize crossbar\n");
+	if (ret) {
+		dev_err(dev, "Failed to initialize crossbar: %d\n", ret);
+		goto err_pm;
+	}
 
 	for (i = 0; i < isi->pdata->num_channels; ++i) {
 		ret = mxc_isi_pipe_init(isi, i);
@@ -502,7 +501,8 @@ static int mxc_isi_probe(struct platform_device *pdev)
 
 err_xbar:
 	mxc_isi_crossbar_cleanup(&isi->crossbar);
-
+err_pm:
+	pm_runtime_disable(isi->dev);
 	return ret;
 }
 
@@ -519,8 +519,10 @@ static void mxc_isi_remove(struct platform_device *pdev)
 		mxc_isi_pipe_cleanup(pipe);
 	}
 
-	mxc_isi_v4l2_cleanup(isi);
 	mxc_isi_crossbar_cleanup(&isi->crossbar);
+	mxc_isi_v4l2_cleanup(isi);
+
+	pm_runtime_disable(isi->dev);
 }
 
 static const struct of_device_id mxc_isi_of_match[] = {

@@ -3797,7 +3797,6 @@ int be_cmd_get_perm_mac(struct be_adapter *adapter, u8 *mac)
 {
 	int status;
 	bool pmac_valid = false;
-	u32 pmac_id;
 
 	eth_zero_addr(mac);
 
@@ -3810,7 +3809,7 @@ int be_cmd_get_perm_mac(struct be_adapter *adapter, u8 *mac)
 						       adapter->if_handle, 0);
 	} else {
 		status = be_cmd_get_mac_from_list(adapter, mac, &pmac_valid,
-						  &pmac_id, adapter->if_handle, 0);
+						  NULL, adapter->if_handle, 0);
 	}
 
 	return status;
@@ -3853,8 +3852,8 @@ int be_cmd_set_mac_list(struct be_adapter *adapter, u8 *mac_array,
 	status = be_mcc_notify_wait(adapter);
 
 err:
-	spin_unlock_bh(&adapter->mcc_lock);
 	dma_free_coherent(&adapter->pdev->dev, cmd.size, cmd.va, cmd.dma);
+	spin_unlock_bh(&adapter->mcc_lock);
 	return status;
 }
 

@@ -25,9 +25,7 @@
 #include <linux/of.h>
 #include <linux/of_graph.h>
 #include <linux/acpi.h>
-#include <linux/pci.h>
 #include <linux/pinctrl/consumer.h>
-#include <linux/pinctrl/devinfo.h>
 #include <linux/reset.h>
 #include <linux/bitfield.h>
 
@@ -35,8 +33,6 @@
 #include <linux/usb/gadget.h>
 #include <linux/usb/of.h>
 #include <linux/usb/otg.h>
-
-#include <trace/hooks/dwc3.h>
 
 #include "core.h"
 #include "gadget.h"
@@ -158,7 +154,6 @@ void dwc3_set_prtcap(struct dwc3 *dwc, u32 mode, bool ignore_susphy)
 	dwc3_writel(dwc->regs, DWC3_GCTL, reg);
 
 	dwc->current_dr_role = mode;
-	trace_dwc3_set_prtcap(mode);
 }
 
 static void __dwc3_set_mode(struct work_struct *work)
@@ -332,18 +327,10 @@ int dwc3_core_soft_reset(struct dwc3 *dwc)
 	if (dwc->current_dr_role == DWC3_GCTL_PRTCAP_HOST)
 		return 0;
 
-	trace_android_vh_dwc3_core_soft_reset(dwc->dev, dwc->regs,
-					      dwc->usb3_generic_phy,
-					      PRE_SOFT_RESET);
-
 	reg = dwc3_readl(dwc->regs, DWC3_DCTL);
 	reg |= DWC3_DCTL_CSFTRST;
 	reg &= ~DWC3_DCTL_RUN_STOP;
 	dwc3_gadget_dctl_write_safe(dwc, reg);
-
-	trace_android_vh_dwc3_core_soft_reset(dwc->dev, dwc->regs,
-					      dwc->usb3_generic_phy,
-					      SOFT_RESET_INITIATED);
 
 	/*
 	 * For DWC_usb31 controller 1.90a and later, the DCTL.CSFRST bit
@@ -365,9 +352,6 @@ int dwc3_core_soft_reset(struct dwc3 *dwc)
 			udelay(1);
 	} while (--retries);
 
-	trace_android_vh_dwc3_core_soft_reset(dwc->dev, dwc->regs,
-					      dwc->usb3_generic_phy,
-					      POST_SOFT_RESET);
 	dev_warn(dwc->dev, "DWC3 controller soft reset failed.\n");
 	return -ETIMEDOUT;
 
@@ -380,9 +364,6 @@ done:
 	if (DWC3_VER_IS_WITHIN(DWC31, ANY, 180A))
 		msleep(50);
 
-	trace_android_vh_dwc3_core_soft_reset(dwc->dev, dwc->regs,
-					      dwc->usb3_generic_phy,
-					      POST_SOFT_RESET);
 	return 0;
 }
 
@@ -1006,8 +987,6 @@ static bool dwc3_core_is_valid(struct dwc3 *dwc)
 
 	reg = dwc3_readl(dwc->regs, DWC3_GSNPSID);
 	dwc->ip = DWC3_GSNPS_ID(reg);
-	if (dwc->ip == DWC4_IP)
-		dwc->ip = DWC32_IP;
 
 	/* This should read as U3 followed by revision number */
 	if (DWC3_IP_IS(DWC3)) {
@@ -1354,6 +1333,12 @@ static int dwc3_core_init(struct dwc3 *dwc)
 
 	hw_mode = DWC3_GHWPARAMS0_MODE(dwc->hwparams.hwparams0);
 
+	/*
+	 * Write Linux Version Code to our GUID register so it's easy to figure
+	 * out which kernel version a bug was found.
+	 */
+	dwc3_writel(dwc->regs, DWC3_GUID, LINUX_VERSION_CODE);
+
 	ret = dwc3_phy_setup(dwc);
 	if (ret)
 		return ret;
@@ -1384,12 +1369,6 @@ static int dwc3_core_init(struct dwc3 *dwc)
 	ret = dwc3_core_soft_reset(dwc);
 	if (ret)
 		goto err_exit_phy;
-
-	/*
-	 * Write Linux Version Code to our GUID register so it's easy to figure
-	 * out which kernel version a bug was found.
-	 */
-	dwc3_writel(dwc->regs, DWC3_GUID, LINUX_VERSION_CODE);
 
 	dwc3_core_setup_global_control(dwc);
 	dwc3_core_num_eps(dwc);
@@ -2140,20 +2119,6 @@ static int dwc3_get_num_ports(struct dwc3 *dwc)
 	return 0;
 }
 
-static void dwc3_vbus_draw_work(struct work_struct *work)
-{
-	struct dwc3 *dwc = container_of(work, struct dwc3, vbus_draw_work);
-	union power_supply_propval val = {0};
-	int ret;
-
-	val.intval = 1000 * (dwc->current_limit);
-	ret = power_supply_set_property(dwc->usb_psy, POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT, &val);
-
-	if (ret < 0)
-		dev_dbg(dwc->dev, "Error (%d) setting vbus draw (%d mA)\n",
-			ret, dwc->current_limit);
-}
-
 static struct power_supply *dwc3_get_usb_power_supply(struct dwc3 *dwc)
 {
 	struct power_supply *usb_psy;
@@ -2168,7 +2133,6 @@ static struct power_supply *dwc3_get_usb_power_supply(struct dwc3 *dwc)
 	if (!usb_psy)
 		return ERR_PTR(-EPROBE_DEFER);
 
-	INIT_WORK(&dwc->vbus_draw_work, dwc3_vbus_draw_work);
 	return usb_psy;
 }
 
@@ -2259,7 +2223,7 @@ static int dwc3_probe(struct platform_device *pdev)
 	platform_set_drvdata(pdev, dwc);
 	dwc3_cache_hwparams(dwc);
 
-	if (!dev_is_pci(dwc->sysdev) &&
+	if (!dwc->sysdev_is_parent &&
 	    DWC3_GHWPARAMS0_AWIDTH(dwc->hwparams.hwparams0) == 64) {
 		ret = dma_set_mask_and_coherent(dwc->sysdev, DMA_BIT_MASK(64));
 		if (ret)
@@ -2377,10 +2341,8 @@ static void dwc3_remove(struct platform_device *pdev)
 
 	dwc3_free_event_buffers(dwc);
 
-	if (dwc->usb_psy) {
-		cancel_work_sync(&dwc->vbus_draw_work);
+	if (dwc->usb_psy)
 		power_supply_put(dwc->usb_psy);
-	}
 }
 
 #ifdef CONFIG_PM
@@ -2689,31 +2651,14 @@ static void dwc3_complete(struct device *dev)
 		dwc3_writel(dwc->regs, DWC3_GUCTL3, reg);
 	}
 }
-
-static int dwc3_prepare(struct device *dev)
-{
-	struct dwc3	*dwc = dev_get_drvdata(dev);
-
-	/*
-	 * Indicate to the PM core that it may safely leave the device in
-	 * runtime suspend if runtime-suspended already in device mode.
-	 */
-	if (dwc->current_dr_role == DWC3_GCTL_PRTCAP_DEVICE &&
-	    pm_runtime_suspended(dev) &&
-	    !dev_pinctrl(dev))
-		return 1;
-
-	return 0;
-}
 #else
 #define dwc3_complete NULL
-#define dwc3_prepare NULL
 #endif /* CONFIG_PM_SLEEP */
 
 static const struct dev_pm_ops dwc3_dev_pm_ops = {
 	SET_SYSTEM_SLEEP_PM_OPS(dwc3_suspend, dwc3_resume)
 	.complete = dwc3_complete,
-	.prepare = dwc3_prepare,
+
 	/*
 	 * Runtime suspend halts the controller on disconnection. It relies on
 	 * platforms with custom connection notification to start the controller
@@ -2759,12 +2704,6 @@ static struct platform_driver dwc3_driver = {
 };
 
 module_platform_driver(dwc3_driver);
-
-/*
- * For type visibility (http://b/236036821)
- */
-const struct dwc3 *const ANDROID_GKI_struct_dwc3;
-EXPORT_SYMBOL_GPL(ANDROID_GKI_struct_dwc3);
 
 MODULE_ALIAS("platform:dwc3");
 MODULE_AUTHOR("Felipe Balbi <balbi@ti.com>");

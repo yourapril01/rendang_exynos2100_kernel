@@ -1139,20 +1139,6 @@ static void panthor_vm_cleanup_op_ctx(struct panthor_vm_op_ctx *op_ctx,
 	}
 }
 
-static void
-panthor_vm_op_ctx_return_vma(struct panthor_vm_op_ctx *op_ctx,
-			     struct panthor_vma *vma)
-{
-	for (u32 i = 0; i < ARRAY_SIZE(op_ctx->preallocated_vmas); i++) {
-		if (!op_ctx->preallocated_vmas[i]) {
-			op_ctx->preallocated_vmas[i] = vma;
-			return;
-		}
-	}
-
-	WARN_ON_ONCE(1);
-}
-
 static struct panthor_vma *
 panthor_vm_op_ctx_get_vma(struct panthor_vm_op_ctx *op_ctx)
 {
@@ -1182,14 +1168,10 @@ panthor_vm_op_ctx_prealloc_vmas(struct panthor_vm_op_ctx *op_ctx)
 		break;
 
 	case DRM_PANTHOR_VM_BIND_OP_TYPE_UNMAP:
-		/* Two VMAs can be needed for an unmap, as an unmap can happen
-		 * in the middle of a drm_gpuva, requiring a remap with both
-		 * prev & next VA. Or an unmap can span more than one drm_gpuva
-		 * where the first and last ones are covered partially, requring
-		 * a remap for the first with a prev VA and remap for the last
-		 * with a next VA.
+		/* Partial unmaps might trigger a remap with either a prev or a next VA,
+		 * but not both.
 		 */
-		vma_count = 2;
+		vma_count = 1;
 		break;
 
 	default:
@@ -1233,7 +1215,7 @@ static int panthor_vm_prepare_map_op_ctx(struct panthor_vm_op_ctx *op_ctx,
 	    (flags & DRM_PANTHOR_VM_BIND_OP_TYPE_MASK) != DRM_PANTHOR_VM_BIND_OP_TYPE_MAP)
 		return -EINVAL;
 
-	/* Make sure the VA and size are in-bounds. */
+	/* Make sure the VA and size are aligned and in-bounds. */
 	if (size > bo->base.base.size || offset > bo->base.base.size - size)
 		return -EINVAL;
 
@@ -1553,10 +1535,6 @@ static void panthor_vm_destroy(struct panthor_vm *vm)
 		return;
 
 	vm->destroyed = true;
-
-	/* Tell scheduler to stop all GPU work related to this VM */
-	if (refcount_read(&vm->as.active_cnt) > 0)
-		panthor_sched_prepare_for_vm_destruction(vm->ptdev);
 
 	mutex_lock(&vm->heaps.lock);
 	panthor_heap_pool_destroy(vm->heaps.pool);
@@ -2055,10 +2033,8 @@ static int panthor_gpuva_sm_step_map(struct drm_gpuva_op *op, void *priv)
 	ret = panthor_vm_map_pages(vm, op->map.va.addr, flags_to_prot(vma->flags),
 				   op_ctx->map.sgt, op->map.gem.offset,
 				   op->map.va.range);
-	if (ret) {
-		panthor_vm_op_ctx_return_vma(op_ctx, vma);
+	if (ret)
 		return ret;
-	}
 
 	/* Ref owned by the mapping now, clear the obj field so we don't release the
 	 * pinning/obj ref behind GPUVA's back.
@@ -2409,7 +2385,7 @@ panthor_vm_bind_prepare_op_ctx(struct drm_file *file,
 	int ret;
 
 	/* Aligned on page size. */
-	if (!IS_ALIGNED(op->va | op->size | op->bo_offset, vm_pgsz))
+	if (!IS_ALIGNED(op->va | op->size, vm_pgsz))
 		return -EINVAL;
 
 	switch (op->flags & DRM_PANTHOR_VM_BIND_OP_TYPE_MASK) {

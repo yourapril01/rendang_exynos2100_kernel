@@ -597,19 +597,6 @@ void npc_set_mcam_action(struct rvu *rvu, struct npc_mcam *mcam,
 			   NPC_AF_MCAMEX_BANKX_ACTION(index, bank), cfg);
 }
 
-u32 rvu_get_cpt_chan_mask(struct rvu *rvu)
-{
-	/* For cn10k the upper two bits of the channel number are
-	 * cpt channel number. with masking out these bits in the
-	 * mcam entry, same entry used for NIX will allow packets
-	 * received from cpt for parsing.
-	 */
-	if (!is_rvu_otx2(rvu))
-		return NIX_CHAN_CPT_X2P_MASK;
-	else
-		return 0xFFFu;
-}
-
 void rvu_npc_install_ucast_entry(struct rvu *rvu, u16 pcifunc,
 				 int nixlf, u64 chan, u8 *mac_addr)
 {
@@ -653,7 +640,7 @@ void rvu_npc_install_ucast_entry(struct rvu *rvu, u16 pcifunc,
 	eth_broadcast_addr((u8 *)&req.mask.dmac);
 	req.features = BIT_ULL(NPC_DMAC);
 	req.channel = chan;
-	req.chan_mask = rvu_get_cpt_chan_mask(rvu);
+	req.chan_mask = 0xFFFU;
 	req.intf = pfvf->nix_rx_intf;
 	req.op = action.op;
 	req.hdr.pcifunc = 0; /* AF is requester */
@@ -723,7 +710,11 @@ void rvu_npc_install_promisc_entry(struct rvu *rvu, u16 pcifunc,
 	 * mcam entry, same entry used for NIX will allow packets
 	 * received from cpt for parsing.
 	 */
-	req.chan_mask = rvu_get_cpt_chan_mask(rvu);
+	if (!is_rvu_otx2(rvu)) {
+		req.chan_mask = NIX_CHAN_CPT_X2P_MASK;
+	} else {
+		req.chan_mask = 0xFFFU;
+	}
 
 	if (chan_cnt > 1) {
 		if (!is_power_of_2(chan_cnt)) {
@@ -862,7 +853,7 @@ void rvu_npc_install_allmulti_entry(struct rvu *rvu, u16 pcifunc, int nixlf,
 	u16 vf_func;
 
 	/* Only CGX PF/VF can add allmulticast entry */
-	if (is_lbk_vf(rvu, pcifunc) || is_sdp_vf(rvu, pcifunc))
+	if (is_lbk_vf(rvu, pcifunc) && is_sdp_vf(rvu, pcifunc))
 		return;
 
 	blkaddr = rvu_get_blkaddr(rvu, BLKTYPE_NPC, 0);
@@ -912,7 +903,16 @@ void rvu_npc_install_allmulti_entry(struct rvu *rvu, u16 pcifunc, int nixlf,
 	ether_addr_copy(req.mask.dmac, mac_addr);
 	req.features = BIT_ULL(NPC_DMAC);
 
-	req.chan_mask = rvu_get_cpt_chan_mask(rvu);
+	/* For cn10k the upper two bits of the channel number are
+	 * cpt channel number. with masking out these bits in the
+	 * mcam entry, same entry used for NIX will allow packets
+	 * received from cpt for parsing.
+	 */
+	if (!is_rvu_otx2(rvu))
+		req.chan_mask = NIX_CHAN_CPT_X2P_MASK;
+	else
+		req.chan_mask = 0xFFFU;
+
 	req.channel = chan;
 	req.intf = pfvf->nix_rx_intf;
 	req.entry = index;
@@ -1058,35 +1058,32 @@ void rvu_npc_update_flowkey_alg_idx(struct rvu *rvu, u16 pcifunc, int nixlf,
 	rvu_write64(rvu, blkaddr,
 		    NPC_AF_MCAMEX_BANKX_ACTION(index, bank), *(u64 *)&action);
 
+	/* update the VF flow rule action with the VF default entry action */
+	if (mcam_index < 0)
+		npc_update_vf_flow_entry(rvu, mcam, blkaddr, pcifunc,
+					 *(u64 *)&action);
+
 	/* update the action change in default rule */
 	pfvf = rvu_get_pfvf(rvu, pcifunc);
 	if (pfvf->def_ucast_rule)
 		pfvf->def_ucast_rule->rx_action = action;
 
-	if (mcam_index < 0) {
-		/* update the VF flow rule action with the VF default
-		 * entry action
-		 */
-		npc_update_vf_flow_entry(rvu, mcam, blkaddr, pcifunc,
-					 *(u64 *)&action);
+	index = npc_get_nixlf_mcam_index(mcam, pcifunc,
+					 nixlf, NIXLF_PROMISC_ENTRY);
 
-		index = npc_get_nixlf_mcam_index(mcam, pcifunc,
-						 nixlf, NIXLF_PROMISC_ENTRY);
+	/* If PF's promiscuous entry is enabled,
+	 * Set RSS action for that entry as well
+	 */
+	npc_update_rx_action_with_alg_idx(rvu, action, pfvf, index, blkaddr,
+					  alg_idx);
 
-		/* If PF's promiscuous  entry is enabled,
-		 * Set RSS action for that entry as well
-		 */
-		npc_update_rx_action_with_alg_idx(rvu, action, pfvf, index,
-						  blkaddr, alg_idx);
-
-		index = npc_get_nixlf_mcam_index(mcam, pcifunc,
-						 nixlf, NIXLF_ALLMULTI_ENTRY);
-		/* If PF's allmulti  entry is enabled,
-		 * Set RSS action for that entry as well
-		 */
-		npc_update_rx_action_with_alg_idx(rvu, action, pfvf, index,
-						  blkaddr, alg_idx);
-	}
+	index = npc_get_nixlf_mcam_index(mcam, pcifunc,
+					 nixlf, NIXLF_ALLMULTI_ENTRY);
+	/* If PF's allmulti  entry is enabled,
+	 * Set RSS action for that entry as well
+	 */
+	npc_update_rx_action_with_alg_idx(rvu, action, pfvf, index, blkaddr,
+					  alg_idx);
 }
 
 void npc_enadis_default_mce_entry(struct rvu *rvu, u16 pcifunc,
@@ -1933,7 +1930,7 @@ int npc_mcam_rsrcs_init(struct rvu *rvu, int blkaddr)
 	/* Alloc memory for MCAM entry to counter mapping and for tracking
 	 * counter's reference count.
 	 */
-	mcam->entry2cntr_map = kcalloc(mcam->total_entries, sizeof(u16),
+	mcam->entry2cntr_map = kcalloc(mcam->bmap_entries, sizeof(u16),
 				       GFP_KERNEL);
 	if (!mcam->entry2cntr_map)
 		goto free_cntr_map;
@@ -1944,16 +1941,15 @@ int npc_mcam_rsrcs_init(struct rvu *rvu, int blkaddr)
 		goto free_entry_cntr_map;
 
 	/* Alloc memory for saving target device of mcam rule */
-	mcam->entry2target_pffunc = kcalloc(mcam->total_entries,
-					    sizeof(u16), GFP_KERNEL);
+	mcam->entry2target_pffunc = kmalloc_array(mcam->total_entries,
+						  sizeof(u16), GFP_KERNEL);
 	if (!mcam->entry2target_pffunc)
 		goto free_cntr_refcnt;
 
-	for (index = 0; index < mcam->bmap_entries; index++)
+	for (index = 0; index < mcam->bmap_entries; index++) {
 		mcam->entry2pfvf_map[index] = NPC_MCAM_INVALID_MAP;
-
-	for (index = 0; index < mcam->total_entries; index++)
 		mcam->entry2cntr_map[index] = NPC_MCAM_INVALID_MAP;
+	}
 
 	for (cntr = 0; cntr < mcam->counters.max; cntr++)
 		mcam->cntr2pfvf_map[cntr] = NPC_MCAM_INVALID_MAP;
@@ -3047,7 +3043,7 @@ int rvu_mbox_handler_npc_mcam_free_counter(struct rvu *rvu,
 		struct npc_mcam_oper_counter_req *req, struct msg_rsp *rsp)
 {
 	struct npc_mcam *mcam = &rvu->hw->mcam;
-	u16 index;
+	u16 index, entry = 0;
 	int blkaddr, err;
 
 	blkaddr = rvu_get_blkaddr(rvu, BLKTYPE_NPC, 0);
@@ -3065,16 +3061,20 @@ int rvu_mbox_handler_npc_mcam_free_counter(struct rvu *rvu,
 	mcam->cntr2pfvf_map[req->cntr] = NPC_MCAM_INVALID_MAP;
 	rvu_free_rsrc(&mcam->counters, req->cntr);
 
-	/* Disable all MCAM entry's stats which are using this counter.
-	 * Scan the full MCAM index range: AF-reserved rules (e.g. CPT pass-2)
-	 */
-	for (index = 0; index < mcam->total_entries; index++) {
+	/* Disable all MCAM entry's stats which are using this counter */
+	while (entry < mcam->bmap_entries) {
 		if (!mcam->cntr_refcnt[req->cntr])
 			break;
+
+		index = find_next_bit(mcam->bmap, mcam->bmap_entries, entry);
+		if (index >= mcam->bmap_entries)
+			break;
+		entry = index + 1;
 		if (mcam->entry2cntr_map[index] != req->cntr)
 			continue;
-		npc_unmap_mcam_entry_and_cntr(rvu, mcam, blkaddr, index,
-					      req->cntr);
+
+		npc_unmap_mcam_entry_and_cntr(rvu, mcam, blkaddr,
+					      index, req->cntr);
 	}
 
 	mutex_unlock(&mcam->lock);
@@ -3085,7 +3085,7 @@ int rvu_mbox_handler_npc_mcam_unmap_counter(struct rvu *rvu,
 		struct npc_mcam_unmap_counter_req *req, struct msg_rsp *rsp)
 {
 	struct npc_mcam *mcam = &rvu->hw->mcam;
-	u16 index;
+	u16 index, entry = 0;
 	int blkaddr, rc;
 
 	blkaddr = rvu_get_blkaddr(rvu, BLKTYPE_NPC, 0);
@@ -3108,13 +3108,20 @@ int rvu_mbox_handler_npc_mcam_unmap_counter(struct rvu *rvu,
 	}
 
 	/* Disable all MCAM entry's stats which are using this counter */
-	for (index = 0; index < mcam->total_entries; index++) {
+	while (entry < mcam->bmap_entries) {
 		if (!mcam->cntr_refcnt[req->cntr])
 			break;
+
+		index = find_next_bit(mcam->bmap, mcam->bmap_entries, entry);
+		if (index >= mcam->bmap_entries)
+			break;
+		entry = index + 1;
+
 		if (mcam->entry2cntr_map[index] != req->cntr)
 			continue;
-		npc_unmap_mcam_entry_and_cntr(rvu, mcam, blkaddr, index,
-					      req->cntr);
+
+		npc_unmap_mcam_entry_and_cntr(rvu, mcam, blkaddr,
+					      index, req->cntr);
 	}
 exit:
 	mutex_unlock(&mcam->lock);

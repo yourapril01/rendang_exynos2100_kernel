@@ -99,9 +99,11 @@ static irqreturn_t wm831x_isink_irq(int irq, void *data)
 {
 	struct wm831x_isink *isink = data;
 
+	regulator_lock(isink->regulator);
 	regulator_notifier_call_chain(isink->regulator,
 				      REGULATOR_EVENT_OVER_CURRENT,
 				      NULL);
+	regulator_unlock(isink->regulator);
 
 	return IRQ_HANDLED;
 }
@@ -146,10 +148,10 @@ static int wm831x_isink_probe(struct platform_device *pdev)
 	isink->desc.ops = &wm831x_isink_ops;
 	isink->desc.type = REGULATOR_CURRENT;
 	isink->desc.owner = THIS_MODULE;
-	isink->desc.curr_table = wm831x_isinkv_values;
-	isink->desc.n_current_limits = ARRAY_SIZE(wm831x_isinkv_values);
-	isink->desc.csel_reg = isink->reg;
-	isink->desc.csel_mask = WM831X_CS1_ISEL_MASK;
+	isink->desc.curr_table = wm831x_isinkv_values,
+	isink->desc.n_current_limits = ARRAY_SIZE(wm831x_isinkv_values),
+	isink->desc.csel_reg = isink->reg,
+	isink->desc.csel_mask = WM831X_CS1_ISEL_MASK,
 
 	config.dev = pdev->dev.parent;
 	config.init_data = pdata->isink[id];
@@ -189,7 +191,6 @@ static struct platform_driver wm831x_isink_driver = {
 	.probe = wm831x_isink_probe,
 	.driver		= {
 		.name	= "wm831x-isink",
-		.probe_type = PROBE_PREFER_ASYNCHRONOUS,
 	},
 };
 

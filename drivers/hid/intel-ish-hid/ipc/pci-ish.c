@@ -381,7 +381,7 @@ static int __maybe_unused ish_resume(struct device *device)
 	ish_resume_device = device;
 	dev->resume_flag = 1;
 
-	queue_work(dev->unbound_wq, &resume_work);
+	schedule_work(&resume_work);
 
 	return 0;
 }

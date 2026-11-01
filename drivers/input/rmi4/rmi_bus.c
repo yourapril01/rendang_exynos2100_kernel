@@ -90,7 +90,6 @@ int rmi_register_transport_device(struct rmi_transport_dev *xport)
 
 	rmi_dev->dev.bus = &rmi_bus_type;
 	rmi_dev->dev.type = &rmi_device_type;
-	rmi_dev->dev.parent = xport->dev;
 
 	xport->rmi_dev = rmi_dev;
 
@@ -144,9 +143,9 @@ bool rmi_is_function_device(struct device *dev)
 	return dev->type == &rmi_function_type;
 }
 
-static int rmi_function_match(struct device *dev, const struct device_driver *drv)
+static int rmi_function_match(struct device *dev, struct device_driver *drv)
 {
-	const struct rmi_function_handler *handler = to_rmi_function_handler(drv);
+	struct rmi_function_handler *handler = to_rmi_function_handler(drv);
 	struct rmi_function *fn = to_rmi_function(dev);
 
 	return fn->fd.function_number == handler->func;
@@ -277,17 +276,17 @@ void rmi_unregister_function(struct rmi_function *fn)
 
 	device_del(&fn->dev);
 	of_node_put(fn->dev.of_node);
+	put_device(&fn->dev);
 
 	for (i = 0; i < fn->num_of_irqs; i++)
 		irq_dispose_mapping(fn->irq[i]);
 
-	put_device(&fn->dev);
 }
 
 /**
- * __rmi_register_function_handler - register a handler for an RMI function
+ * rmi_register_function_handler - register a handler for an RMI function
  * @handler: RMI handler that should be registered.
- * @owner: pointer to module that implements the handler
+ * @module: pointer to module that implements the handler
  * @mod_name: name of the module implementing the handler
  *
  * This function performs additional setup of RMI function handler and
@@ -333,7 +332,7 @@ EXPORT_SYMBOL_GPL(rmi_unregister_function_handler);
 
 /* Bus specific stuff */
 
-static int rmi_bus_match(struct device *dev, const struct device_driver *drv)
+static int rmi_bus_match(struct device *dev, struct device_driver *drv)
 {
 	bool physical = rmi_is_physical_device(dev);
 
@@ -344,7 +343,7 @@ static int rmi_bus_match(struct device *dev, const struct device_driver *drv)
 	return physical || rmi_function_match(dev, drv);
 }
 
-const struct bus_type rmi_bus_type = {
+struct bus_type rmi_bus_type = {
 	.match		= rmi_bus_match,
 	.name		= "rmi4",
 };
@@ -365,9 +364,6 @@ static struct rmi_function_handler *fn_handlers[] = {
 #endif
 #ifdef CONFIG_RMI4_F34
 	&rmi_f34_handler,
-#endif
-#ifdef CONFIG_RMI4_F3A
-	&rmi_f3a_handler,
 #endif
 #ifdef CONFIG_RMI4_F54
 	&rmi_f54_handler,
@@ -448,13 +444,11 @@ static int __init rmi_bus_init(void)
 	if (error) {
 		pr_err("%s: error registering the RMI physical driver: %d\n",
 			__func__, error);
-		goto err_unregister_function_handlers;
+		goto err_unregister_bus;
 	}
 
 	return 0;
 
-err_unregister_function_handlers:
-	rmi_unregister_function_handlers();
 err_unregister_bus:
 	bus_unregister(&rmi_bus_type);
 	return error;

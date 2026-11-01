@@ -607,6 +607,7 @@ static int tegra_i2c_wait_for_config_load(struct tegra_i2c_dev *i2c_dev)
 static int tegra_i2c_init(struct tegra_i2c_dev *i2c_dev)
 {
 	u32 val, clk_divisor, clk_multiplier, tsu_thd, tlow, thigh, non_hs_mode;
+	acpi_handle handle = ACPI_HANDLE(i2c_dev->dev);
 	struct i2c_timings *t = &i2c_dev->timings;
 	int err;
 
@@ -618,7 +619,11 @@ static int tegra_i2c_init(struct tegra_i2c_dev *i2c_dev)
 	 * emit a noisy warning on error, which won't stay unnoticed and
 	 * won't hose machine entirely.
 	 */
-	err = device_reset(i2c_dev->dev);
+	if (handle)
+		err = acpi_evaluate_object(handle, "_RST", NULL, NULL);
+	else
+		err = reset_control_reset(i2c_dev->rst);
+
 	WARN_ON_ONCE(err);
 
 	if (IS_DVC(i2c_dev))
@@ -1661,6 +1666,19 @@ static void tegra_i2c_parse_dt(struct tegra_i2c_dev *i2c_dev)
 		i2c_dev->is_vi = true;
 }
 
+static int tegra_i2c_init_reset(struct tegra_i2c_dev *i2c_dev)
+{
+	if (ACPI_HANDLE(i2c_dev->dev))
+		return 0;
+
+	i2c_dev->rst = devm_reset_control_get_exclusive(i2c_dev->dev, "i2c");
+	if (IS_ERR(i2c_dev->rst))
+		return dev_err_probe(i2c_dev->dev, PTR_ERR(i2c_dev->rst),
+				      "failed to get reset control\n");
+
+	return 0;
+}
+
 static int tegra_i2c_init_clocks(struct tegra_i2c_dev *i2c_dev)
 {
 	int err;
@@ -1770,6 +1788,10 @@ static int tegra_i2c_probe(struct platform_device *pdev)
 
 	tegra_i2c_parse_dt(i2c_dev);
 
+	err = tegra_i2c_init_reset(i2c_dev);
+	if (err)
+		return err;
+
 	err = tegra_i2c_init_clocks(i2c_dev);
 	if (err)
 		return err;
@@ -1786,11 +1808,8 @@ static int tegra_i2c_probe(struct platform_device *pdev)
 	 *
 	 * VI I2C device shouldn't be marked as IRQ-safe because VI I2C won't
 	 * be used for atomic transfers. ACPI device is not IRQ safe also.
-	 *
-	 * Devices with pinctrl states cannot be marked IRQ-safe as the pinctrl
-	 * state transitions during runtime PM require mutexes.
 	 */
-	if (!IS_VI(i2c_dev) && !has_acpi_companion(i2c_dev->dev) && !i2c_dev->dev->pins)
+	if (!IS_VI(i2c_dev) && !has_acpi_companion(i2c_dev->dev))
 		pm_runtime_irq_safe(i2c_dev->dev);
 
 	pm_runtime_enable(i2c_dev->dev);
@@ -1887,37 +1906,28 @@ static int __maybe_unused tegra_i2c_runtime_suspend(struct device *dev)
 
 static int __maybe_unused tegra_i2c_suspend(struct device *dev)
 {
-	/*
-	 * Bring the controller up and hold a usage count so it stays
-	 * available until the noirq phase.
-	 */
-	return pm_runtime_resume_and_get(dev);
-}
-
-static int __maybe_unused tegra_i2c_suspend_noirq(struct device *dev)
-{
 	struct tegra_i2c_dev *i2c_dev = dev_get_drvdata(dev);
+	int err;
 
 	i2c_mark_adapter_suspended(&i2c_dev->adapter);
 
-	/*
-	 * Runtime PM is already disabled at this point, so invoke the
-	 * runtime_suspend callback directly to put the controller down.
-	 */
-	return tegra_i2c_runtime_suspend(dev);
+	if (!pm_runtime_status_suspended(dev)) {
+		err = tegra_i2c_runtime_suspend(dev);
+		if (err)
+			return err;
+	}
+
+	return 0;
 }
 
-static int __maybe_unused tegra_i2c_resume_noirq(struct device *dev)
+static int __maybe_unused tegra_i2c_resume(struct device *dev)
 {
 	struct tegra_i2c_dev *i2c_dev = dev_get_drvdata(dev);
 	int err;
 
 	/*
-	 * Runtime PM is still disabled at this point, so invoke the
-	 * runtime_resume callback directly to bring the controller back up
-	 * before re-initializing the hardware. The adapter is then marked
-	 * resumed so that consumers can issue transfers from their own
-	 * resume_noirq() handlers and onwards.
+	 * We need to ensure that clocks are enabled so that registers can be
+	 * restored in tegra_i2c_init().
 	 */
 	err = tegra_i2c_runtime_resume(dev);
 	if (err)
@@ -1927,22 +1937,24 @@ static int __maybe_unused tegra_i2c_resume_noirq(struct device *dev)
 	if (err)
 		return err;
 
+	/*
+	 * In case we are runtime suspended, disable clocks again so that we
+	 * don't unbalance the clock reference counts during the next runtime
+	 * resume transition.
+	 */
+	if (pm_runtime_status_suspended(dev)) {
+		err = tegra_i2c_runtime_suspend(dev);
+		if (err)
+			return err;
+	}
+
 	i2c_mark_adapter_resumed(&i2c_dev->adapter);
 
 	return 0;
 }
 
-static int __maybe_unused tegra_i2c_resume(struct device *dev)
-{
-	pm_runtime_put(dev);
-
-	return 0;
-}
-
 static const struct dev_pm_ops tegra_i2c_pm = {
-	SET_SYSTEM_SLEEP_PM_OPS(tegra_i2c_suspend, tegra_i2c_resume)
-	SET_NOIRQ_SYSTEM_SLEEP_PM_OPS(tegra_i2c_suspend_noirq,
-				      tegra_i2c_resume_noirq)
+	SET_NOIRQ_SYSTEM_SLEEP_PM_OPS(tegra_i2c_suspend, tegra_i2c_resume)
 	SET_RUNTIME_PM_OPS(tegra_i2c_runtime_suspend, tegra_i2c_runtime_resume,
 			   NULL)
 };

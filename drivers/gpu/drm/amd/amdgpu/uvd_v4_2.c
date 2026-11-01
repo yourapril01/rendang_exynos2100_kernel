@@ -90,14 +90,9 @@ static void uvd_v4_2_ring_set_wptr(struct amdgpu_ring *ring)
 	WREG32(mmUVD_RBC_RB_WPTR, lower_32_bits(ring->wptr));
 }
 
-static int uvd_v4_2_early_init(struct amdgpu_ip_block *ip_block)
+static int uvd_v4_2_early_init(void *handle)
 {
-	struct amdgpu_device *adev = ip_block->adev;
-
-	/* UVD doesn't work without DPM, it needs DPM to ungate it. */
-	if (!amdgpu_dpm)
-		return -ENOENT;
-
+	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
 	adev->uvd.num_uvd_inst = 1;
 
 	uvd_v4_2_set_ring_funcs(adev);
@@ -308,7 +303,7 @@ static int uvd_v4_2_start(struct amdgpu_device *adev)
 	/* enable VCPU clock */
 	WREG32(mmUVD_VCPU_CNTL,  1 << 9);
 
-	/* disable interrupt */
+	/* disable interupt */
 	WREG32_P(mmUVD_MASTINT_EN, 0, ~(1 << 1));
 
 #ifdef __BIG_ENDIAN
@@ -318,7 +313,6 @@ static int uvd_v4_2_start(struct amdgpu_device *adev)
 #endif
 	WREG32(mmUVD_LMI_SWAP_CNTL, lmi_swap_cntl);
 	WREG32(mmUVD_MP_SWAP_CNTL, mp_swap_cntl);
-
 	/* initialize UVD memory controller */
 	WREG32(mmUVD_LMI_CTRL, 0x203108);
 

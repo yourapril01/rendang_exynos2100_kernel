@@ -169,15 +169,14 @@ static inline void drm_sched_rq_remove_fifo_locked(struct drm_sched_entity *enti
 	}
 }
 
-void drm_sched_rq_update_fifo_locked(struct drm_sched_entity *entity, ktime_t ts)
+void drm_sched_rq_update_fifo(struct drm_sched_entity *entity, ktime_t ts)
 {
 	/*
 	 * Both locks need to be grabbed, one to protect from entity->rq change
 	 * for entity from within concurrent drm_sched_entity_select_rq and the
 	 * other to update the rb tree structure.
 	 */
-	lockdep_assert_held(&entity->lock);
-
+	spin_lock(&entity->rq_lock);
 	spin_lock(&entity->rq->lock);
 
 	drm_sched_rq_remove_fifo_locked(entity);
@@ -188,6 +187,7 @@ void drm_sched_rq_update_fifo_locked(struct drm_sched_entity *entity, ktime_t ts
 		      drm_sched_entity_compare_before);
 
 	spin_unlock(&entity->rq->lock);
+	spin_unlock(&entity->rq_lock);
 }
 
 /**
@@ -404,7 +404,6 @@ static void drm_sched_run_free_queue(struct drm_gpu_scheduler *sched)
 /**
  * drm_sched_job_done - complete a job
  * @s_job: pointer to the job which is done
- * @result: 0 on success, -ERRNO on error
  *
  * Finish the job's fence and wake up the worker thread.
  */
@@ -953,14 +952,13 @@ int drm_sched_job_add_resv_dependencies(struct drm_sched_job *job,
 	dma_resv_assert_held(resv);
 
 	dma_resv_for_each_fence(&cursor, resv, usage, fence) {
-		/*
-		 * As drm_sched_job_add_dependency always consumes the fence
-		 * reference (even when it fails), and dma_resv_for_each_fence
-		 * is not obtaining one, we need to grab one before calling.
-		 */
-		ret = drm_sched_job_add_dependency(job, dma_fence_get(fence));
-		if (ret)
+		/* Make sure to grab an additional ref on the added fence */
+		dma_fence_get(fence);
+		ret = drm_sched_job_add_dependency(job, fence);
+		if (ret) {
+			dma_fence_put(fence);
 			return ret;
+		}
 	}
 	return 0;
 }

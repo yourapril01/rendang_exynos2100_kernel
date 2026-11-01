@@ -853,7 +853,7 @@ static int nouveau_drm_probe(struct pci_dev *pdev,
 	/* Remove conflicting drivers (vesafb, efifb etc). */
 	ret = drm_aperture_remove_conflicting_pci_framebuffers(pdev, &driver_pci);
 	if (ret)
-		goto fail_nvkm;
+		return ret;
 
 	pci_set_master(pdev);
 

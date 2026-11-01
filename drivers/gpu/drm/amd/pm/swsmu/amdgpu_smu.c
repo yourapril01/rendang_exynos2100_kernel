@@ -746,9 +746,9 @@ static int smu_set_funcs(struct amdgpu_device *adev)
 	return 0;
 }
 
-static int smu_early_init(struct amdgpu_ip_block *ip_block)
+static int smu_early_init(void *handle)
 {
-	struct amdgpu_device *adev = ip_block->adev;
+	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
 	struct smu_context *smu;
 	int r;
 
@@ -1942,12 +1942,6 @@ static int smu_disable_dpms(struct smu_context *smu)
 	    smu->is_apu && (amdgpu_in_reset(adev) || adev->in_s0ix))
 		return 0;
 
-	/* vangogh s0ix */
-	if ((amdgpu_ip_version(adev, MP1_HWIP, 0) == IP_VERSION(11, 5, 0) ||
-	     amdgpu_ip_version(adev, MP1_HWIP, 0) == IP_VERSION(11, 5, 2)) &&
-	    adev->in_s0ix)
-		return 0;
-
 	/*
 	 * For gpu reset, runpm and hibernation through BACO,
 	 * BACO feature has to be kept enabled.
@@ -2158,12 +2152,6 @@ static int smu_resume(void *handle)
 	smu->disable_uclk_switch = 0;
 
 	adev->pm.dpm_enabled = true;
-
-	if (smu->current_power_limit) {
-		ret = smu_set_power_limit(smu, smu->current_power_limit);
-		if (ret && ret != -EOPNOTSUPP)
-			return ret;
-	}
 
 	dev_info(adev->dev, "SMU is resumed successfully!\n");
 

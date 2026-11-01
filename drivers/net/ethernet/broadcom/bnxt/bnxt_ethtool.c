@@ -339,7 +339,7 @@ enum {
 	RX_NETPOLL_DISCARDS,
 };
 
-static const char *const bnxt_ring_drv_stats_arr[] = {
+static const char *const bnxt_ring_err_stats_arr[] = {
 	"rx_total_l4_csum_errors",
 	"rx_total_resets",
 	"rx_total_buf_errors",
@@ -499,7 +499,7 @@ static const struct {
 	BNXT_TX_STATS_PRI_ENTRIES(tx_packets),
 };
 
-#define BNXT_NUM_RING_DRV_STATS	ARRAY_SIZE(bnxt_ring_drv_stats_arr)
+#define BNXT_NUM_RING_ERR_STATS	ARRAY_SIZE(bnxt_ring_err_stats_arr)
 #define BNXT_NUM_PORT_STATS ARRAY_SIZE(bnxt_port_stats_arr)
 #define BNXT_NUM_STATS_PRI			\
 	(ARRAY_SIZE(bnxt_rx_bytes_pri_arr) +	\
@@ -538,7 +538,7 @@ static int bnxt_get_num_stats(struct bnxt *bp)
 	int num_stats = bnxt_get_num_ring_stats(bp);
 	int len;
 
-	num_stats += BNXT_NUM_RING_DRV_STATS;
+	num_stats += BNXT_NUM_RING_ERR_STATS;
 
 	if (bp->flags & BNXT_FLAG_PORT_STATS)
 		num_stats += BNXT_NUM_PORT_STATS;
@@ -593,7 +593,7 @@ static bool is_tx_ring(struct bnxt *bp, int ring_num)
 static void bnxt_get_ethtool_stats(struct net_device *dev,
 				   struct ethtool_stats *stats, u64 *buf)
 {
-	struct bnxt_total_ring_drv_stats ring_drv_stats = {0};
+	struct bnxt_total_ring_err_stats ring_err_stats = {0};
 	struct bnxt *bp = netdev_priv(dev);
 	u64 *curr, *prev;
 	u32 tpa_stats;
@@ -604,7 +604,6 @@ static void bnxt_get_ethtool_stats(struct net_device *dev,
 		goto skip_ring_stats;
 	}
 
-	bnxt_sync_ring_stats(bp);
 	tpa_stats = bnxt_get_num_tpa_ring_stats(bp);
 	for (i = 0; i < bp->cp_nr_rings; i++) {
 		struct bnxt_napi *bnapi = bp->bnapi[i];
@@ -643,12 +642,12 @@ skip_tpa_ring_stats:
 			buf[j] = sw[k];
 	}
 
-	bnxt_get_ring_drv_stats(bp, &ring_drv_stats);
+	bnxt_get_ring_err_stats(bp, &ring_err_stats);
 
 skip_ring_stats:
-	curr = &ring_drv_stats.rx_total_l4_csum_errors;
-	prev = &bp->ring_drv_stats_prev.rx_total_l4_csum_errors;
-	for (i = 0; i < BNXT_NUM_RING_DRV_STATS; i++, j++, curr++, prev++)
+	curr = &ring_err_stats.rx_total_l4_csum_errors;
+	prev = &bp->ring_err_stats_prev.rx_total_l4_csum_errors;
+	for (i = 0; i < BNXT_NUM_RING_ERR_STATS; i++, j++, curr++, prev++)
 		buf[j] = *curr + *prev;
 
 	if (bp->flags & BNXT_FLAG_PORT_STATS) {
@@ -706,105 +705,112 @@ skip_ring_stats:
 static void bnxt_get_strings(struct net_device *dev, u32 stringset, u8 *buf)
 {
 	struct bnxt *bp = netdev_priv(dev);
+	static const char * const *str;
 	u32 i, j, num_str;
-	const char *str;
 
 	switch (stringset) {
 	case ETH_SS_STATS:
 		for (i = 0; i < bp->cp_nr_rings; i++) {
-			if (is_rx_ring(bp, i))
-				for (j = 0; j < NUM_RING_RX_HW_STATS; j++) {
-					str = bnxt_ring_rx_stats_str[j];
-					ethtool_sprintf(&buf, "[%d]: %s", i,
-							str);
+			if (is_rx_ring(bp, i)) {
+				num_str = NUM_RING_RX_HW_STATS;
+				for (j = 0; j < num_str; j++) {
+					sprintf(buf, "[%d]: %s", i,
+						bnxt_ring_rx_stats_str[j]);
+					buf += ETH_GSTRING_LEN;
 				}
-			if (is_tx_ring(bp, i))
-				for (j = 0; j < NUM_RING_TX_HW_STATS; j++) {
-					str = bnxt_ring_tx_stats_str[j];
-					ethtool_sprintf(&buf, "[%d]: %s", i,
-							str);
+			}
+			if (is_tx_ring(bp, i)) {
+				num_str = NUM_RING_TX_HW_STATS;
+				for (j = 0; j < num_str; j++) {
+					sprintf(buf, "[%d]: %s", i,
+						bnxt_ring_tx_stats_str[j]);
+					buf += ETH_GSTRING_LEN;
 				}
+			}
 			num_str = bnxt_get_num_tpa_ring_stats(bp);
 			if (!num_str || !is_rx_ring(bp, i))
 				goto skip_tpa_stats;
 
 			if (bp->max_tpa_v2)
-				for (j = 0; j < num_str; j++) {
-					str = bnxt_ring_tpa2_stats_str[j];
-					ethtool_sprintf(&buf, "[%d]: %s", i,
-							str);
-				}
+				str = bnxt_ring_tpa2_stats_str;
 			else
-				for (j = 0; j < num_str; j++) {
-					str = bnxt_ring_tpa_stats_str[j];
-					ethtool_sprintf(&buf, "[%d]: %s", i,
-							str);
-				}
+				str = bnxt_ring_tpa_stats_str;
+
+			for (j = 0; j < num_str; j++) {
+				sprintf(buf, "[%d]: %s", i, str[j]);
+				buf += ETH_GSTRING_LEN;
+			}
 skip_tpa_stats:
-			if (is_rx_ring(bp, i))
-				for (j = 0; j < NUM_RING_RX_SW_STATS; j++) {
-					str = bnxt_rx_sw_stats_str[j];
-					ethtool_sprintf(&buf, "[%d]: %s", i,
-							str);
+			if (is_rx_ring(bp, i)) {
+				num_str = NUM_RING_RX_SW_STATS;
+				for (j = 0; j < num_str; j++) {
+					sprintf(buf, "[%d]: %s", i,
+						bnxt_rx_sw_stats_str[j]);
+					buf += ETH_GSTRING_LEN;
 				}
-			for (j = 0; j < NUM_RING_CMN_SW_STATS; j++) {
-				str = bnxt_cmn_sw_stats_str[j];
-				ethtool_sprintf(&buf, "[%d]: %s", i, str);
+			}
+			num_str = NUM_RING_CMN_SW_STATS;
+			for (j = 0; j < num_str; j++) {
+				sprintf(buf, "[%d]: %s", i,
+					bnxt_cmn_sw_stats_str[j]);
+				buf += ETH_GSTRING_LEN;
 			}
 		}
-		for (i = 0; i < BNXT_NUM_RING_DRV_STATS; i++)
-			ethtool_puts(&buf, bnxt_ring_drv_stats_arr[i]);
+		for (i = 0; i < BNXT_NUM_RING_ERR_STATS; i++) {
+			strscpy(buf, bnxt_ring_err_stats_arr[i], ETH_GSTRING_LEN);
+			buf += ETH_GSTRING_LEN;
+		}
 
-		if (bp->flags & BNXT_FLAG_PORT_STATS)
+		if (bp->flags & BNXT_FLAG_PORT_STATS) {
 			for (i = 0; i < BNXT_NUM_PORT_STATS; i++) {
-				str = bnxt_port_stats_arr[i].string;
-				ethtool_puts(&buf, str);
+				strcpy(buf, bnxt_port_stats_arr[i].string);
+				buf += ETH_GSTRING_LEN;
 			}
-
+		}
 		if (bp->flags & BNXT_FLAG_PORT_STATS_EXT) {
 			u32 len;
 
 			len = min_t(u32, bp->fw_rx_stats_ext_size,
 				    ARRAY_SIZE(bnxt_port_stats_ext_arr));
 			for (i = 0; i < len; i++) {
-				str = bnxt_port_stats_ext_arr[i].string;
-				ethtool_puts(&buf, str);
+				strcpy(buf, bnxt_port_stats_ext_arr[i].string);
+				buf += ETH_GSTRING_LEN;
 			}
-
 			len = min_t(u32, bp->fw_tx_stats_ext_size,
 				    ARRAY_SIZE(bnxt_tx_port_stats_ext_arr));
 			for (i = 0; i < len; i++) {
-				str = bnxt_tx_port_stats_ext_arr[i].string;
-				ethtool_puts(&buf, str);
+				strcpy(buf,
+				       bnxt_tx_port_stats_ext_arr[i].string);
+				buf += ETH_GSTRING_LEN;
 			}
-
 			if (bp->pri2cos_valid) {
 				for (i = 0; i < 8; i++) {
-					str = bnxt_rx_bytes_pri_arr[i].string;
-					ethtool_puts(&buf, str);
+					strcpy(buf,
+					       bnxt_rx_bytes_pri_arr[i].string);
+					buf += ETH_GSTRING_LEN;
 				}
-
 				for (i = 0; i < 8; i++) {
-					str = bnxt_rx_pkts_pri_arr[i].string;
-					ethtool_puts(&buf, str);
+					strcpy(buf,
+					       bnxt_rx_pkts_pri_arr[i].string);
+					buf += ETH_GSTRING_LEN;
 				}
-
 				for (i = 0; i < 8; i++) {
-					str = bnxt_tx_bytes_pri_arr[i].string;
-					ethtool_puts(&buf, str);
+					strcpy(buf,
+					       bnxt_tx_bytes_pri_arr[i].string);
+					buf += ETH_GSTRING_LEN;
 				}
-
 				for (i = 0; i < 8; i++) {
-					str = bnxt_tx_pkts_pri_arr[i].string;
-					ethtool_puts(&buf, str);
+					strcpy(buf,
+					       bnxt_tx_pkts_pri_arr[i].string);
+					buf += ETH_GSTRING_LEN;
 				}
 			}
 		}
 		break;
 	case ETH_SS_TEST:
 		if (bp->num_tests)
-			for (i = 0; i < bp->num_tests; i++)
-				ethtool_puts(&buf, bp->test_info->string[i]);
+			memcpy(buf, bp->test_info->string,
+			       bp->num_tests * ETH_GSTRING_LEN);
 		break;
 	default:
 		netdev_err(bp->dev, "bnxt_get_strings invalid request %x\n",
@@ -952,8 +958,8 @@ static int bnxt_set_channels(struct net_device *dev,
 
 	if (bnxt_get_nr_rss_ctxs(bp, req_rx_rings) !=
 	    bnxt_get_nr_rss_ctxs(bp, bp->rx_nr_rings) &&
-	    (netif_is_rxfh_configured(dev) || bp->num_rss_ctx)) {
-		netdev_warn(dev, "RSS table size change required, RSS table entries must be default (with no additional RSS contexts present) to proceed\n");
+	    netif_is_rxfh_configured(dev)) {
+		netdev_warn(dev, "RSS table size change required, RSS table entries must be default to proceed\n");
 		return -EINVAL;
 	}
 
@@ -1315,17 +1321,16 @@ static int bnxt_add_ntuple_cls_rule(struct bnxt *bp,
 	struct bnxt_l2_filter *l2_fltr;
 	struct bnxt_flow_masks *fmasks;
 	struct flow_keys *fkeys;
-	u32 idx;
+	u32 idx, ring;
 	int rc;
+	u8 vf;
 
 	if (!bp->vnic_info)
 		return -EAGAIN;
 
-	if (fs->flow_type & (FLOW_MAC_EXT | FLOW_EXT))
-		return -EOPNOTSUPP;
-
-	if (fs->ring_cookie != RX_CLS_FLOW_DISC &&
-	    ethtool_get_flow_spec_ring_vf(fs->ring_cookie))
+	vf = ethtool_get_flow_spec_ring_vf(fs->ring_cookie);
+	ring = ethtool_get_flow_spec_ring(fs->ring_cookie);
+	if ((fs->flow_type & (FLOW_MAC_EXT | FLOW_EXT)) || vf)
 		return -EOPNOTSUPP;
 
 	if (flow_type == IP_USER_FLOW) {
@@ -1449,7 +1454,7 @@ static int bnxt_add_ntuple_cls_rule(struct bnxt *bp,
 	if (fs->ring_cookie == RX_CLS_FLOW_DISC)
 		new_fltr->base.flags |= BNXT_ACT_DROP;
 	else
-		new_fltr->base.rxq = ethtool_get_flow_spec_ring(fs->ring_cookie);
+		new_fltr->base.rxq = ring;
 	__set_bit(BNXT_FLTR_VALID, &new_fltr->base.state);
 	rc = bnxt_insert_ntp_filter(bp, new_fltr, idx);
 	if (!rc) {

@@ -481,10 +481,11 @@ static int vdec_s_parm(struct file *file, void *fh, struct v4l2_streamparm *a)
 	us_per_frame = timeperframe->numerator * (u64)USEC_PER_SEC;
 	do_div(us_per_frame, timeperframe->denominator);
 
-	us_per_frame = clamp(us_per_frame, 1, USEC_PER_SEC);
+	if (!us_per_frame)
+		return -EINVAL;
+
 	fps = (u64)USEC_PER_SEC;
 	do_div(fps, us_per_frame);
-	fps = min(VENUS_MAX_FPS, fps);
 
 	inst->fps = fps;
 	inst->timeperframe = *timeperframe;
@@ -568,13 +569,7 @@ vdec_decoder_cmd(struct file *file, void *fh, struct v4l2_decoder_cmd *cmd)
 
 		fdata.buffer_type = HFI_BUFFER_INPUT;
 		fdata.flags |= HFI_BUFFERFLAG_EOS;
-
-		/* Send NULL EOS addr for only IRIS2 (SM8250),for firmware <= 1.0.87.
-		 * SC7280 also reports "1.0.<hash>" parsed as 1.0.0; restricting to IRIS2
-		 * avoids misapplying this quirk and breaking VP9 decode on SC7280.
-		 */
-
-		if (IS_IRIS2(inst->core) && is_fw_rev_or_older(inst->core, 1, 0, 87))
+		if (IS_V6(inst->core) && is_fw_rev_or_older(inst->core, 1, 0, 87))
 			fdata.device_addr = 0;
 		else
 			fdata.device_addr = 0xdeadb000;
@@ -1439,10 +1434,10 @@ static void vdec_buf_done(struct venus_inst *inst, unsigned int buf_type,
 				inst->drain_active = false;
 				inst->codec_state = VENUS_DEC_STATE_STOPPED;
 			}
-		} else {
-			if (!bytesused)
-				state = VB2_BUF_STATE_ERROR;
 		}
+
+		if (!bytesused)
+			state = VB2_BUF_STATE_ERROR;
 	} else {
 		vbuf->sequence = inst->sequence_out++;
 	}

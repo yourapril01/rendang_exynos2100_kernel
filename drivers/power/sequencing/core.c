@@ -543,17 +543,14 @@ void pwrseq_device_unregister(struct pwrseq_device *pwrseq)
 	struct device *dev = &pwrseq->dev;
 	struct pwrseq_target *target;
 
-	scoped_guard(rwsem_write, &pwrseq_sem) {
+	scoped_guard(mutex, &pwrseq->state_lock) {
 		guard(rwsem_write)(&pwrseq->rw_lock);
 
-		/*
-		 * Holding rw_lock for write excludes all power on/off callers
-		 * (they hold it for read), so it's safe to read enable_count
-		 * here without taking the state_lock.
-		 */
 		list_for_each_entry(target, &pwrseq->targets, list)
 			WARN(target->unit->enable_count,
 			     "REMOVING POWER SEQUENCER WITH ACTIVE USERS\n");
+
+		guard(rwsem_write)(&pwrseq_sem);
 
 		device_del(dev);
 	}
@@ -917,10 +914,8 @@ int pwrseq_power_on(struct pwrseq_desc *desc)
 	if (target->post_enable) {
 		ret = target->post_enable(pwrseq);
 		if (ret) {
-			scoped_guard(mutex, &pwrseq->state_lock) {
-				pwrseq_unit_disable(pwrseq, unit);
-				desc->powered_on = false;
-			}
+			pwrseq_unit_disable(pwrseq, unit);
+			desc->powered_on = false;
 		}
 	}
 
@@ -993,9 +988,8 @@ static void *pwrseq_debugfs_seq_start(struct seq_file *seq, loff_t *pos)
 	ctx.index = *pos;
 
 	/*
-	 * Hold the lock for the entire printout to prevent device removal.
-	 * Reference counts are managed by start()/next()/stop() as required
-	 * by the seq_file contract.
+	 * We're holding the lock for the entire printout so no need to fiddle
+	 * with device reference count.
 	 */
 	down_read(&pwrseq_sem);
 
@@ -1003,7 +997,7 @@ static void *pwrseq_debugfs_seq_start(struct seq_file *seq, loff_t *pos)
 	if (!ctx.index)
 		return NULL;
 
-	return get_device(ctx.dev);
+	return ctx.dev;
 }
 
 static void *pwrseq_debugfs_seq_next(struct seq_file *seq, void *data,
@@ -1013,9 +1007,8 @@ static void *pwrseq_debugfs_seq_next(struct seq_file *seq, void *data,
 
 	++*pos;
 
-	struct device *next = bus_find_next_device(&pwrseq_bus, curr);
-
-	put_device(curr);
+	struct device *next __free(put_device) =
+			bus_find_next_device(&pwrseq_bus, curr);
 	return next;
 }
 
@@ -1064,8 +1057,6 @@ static int pwrseq_debugfs_seq_show(struct seq_file *seq, void *data)
 
 static void pwrseq_debugfs_seq_stop(struct seq_file *seq, void *data)
 {
-	if (data)
-		put_device(data);
 	up_read(&pwrseq_sem);
 }
 

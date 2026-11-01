@@ -60,8 +60,6 @@ enum tegra_pinconf_param {
 	TEGRA_PINCONF_PARAM_SLEW_RATE_RISING,
 	/* argument: Integer, range is HW-dependant */
 	TEGRA_PINCONF_PARAM_DRIVE_TYPE,
-	/* argument: Boolean */
-	TEGRA_PINCONF_PARAM_GPIO_MODE,
 };
 
 enum tegra_pinconf_pull {
