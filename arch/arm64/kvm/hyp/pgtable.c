@@ -132,7 +132,7 @@ static bool kvm_pgtable_walk_continue(const struct kvm_pgtable_walker *walker,
 	 * page table walk.
 	 */
 	if (r == -EAGAIN)
-		return walker->flags & KVM_PGTABLE_WALK_IGNORE_EAGAIN;
+		return !(walker->flags & KVM_PGTABLE_WALK_HANDLE_FAULT);
 
 	return !r;
 }
@@ -993,7 +993,7 @@ static int stage2_map_walker_try_leaf(const struct kvm_pgtable_visit_ctx *ctx,
 
 	/* Perform CMOs before installation of the guest stage-2 PTE */
 	if (!kvm_pgtable_walk_skip_cmo(ctx) && mm_ops->dcache_clean_inval_poc &&
-	    stage2_pte_cacheable(pgt, new) && !stage2_has_fwb(pgt))
+	    stage2_pte_cacheable(pgt, new))
 		mm_ops->dcache_clean_inval_poc(kvm_pte_follow(new, mm_ops),
 					       granule);
 
@@ -1024,21 +1024,22 @@ static int stage2_map_walk_table_pre(const struct kvm_pgtable_visit_ctx *ctx,
 	return 0;
 }
 
-static void stage2_map_prefault_idmap(struct kvm_pgtable_pte_ops *pte_ops,
+static void stage2_map_prefault_block(struct kvm_pgtable_pte_ops *pte_ops,
 				      const struct kvm_pgtable_visit_ctx *ctx,
 				      kvm_pte_t *ptep)
 {
 	kvm_pte_t block_pte = ctx->old;
 	u64 pa, granule;
+	bool counted;
 	int i;
-
-	WARN_ON(pte_ops->pte_is_counted_cb(block_pte, ctx->level));
 
 	if (!kvm_pte_valid(block_pte))
 		return;
 
-	pa = ALIGN_DOWN(ctx->addr, kvm_granule_size(ctx->level));
+	pa = kvm_pte_to_phys(block_pte);
 	granule = kvm_granule_size(ctx->level + 1);
+	counted = pte_ops->pte_is_counted_cb(block_pte, ctx->level + 1);
+
 	for (i = 0; i < PTRS_PER_PTE; ++i, ++ptep, pa += granule) {
 		kvm_pte_t pte = kvm_init_valid_leaf_pte(
 			pa, block_pte, ctx->level + 1);
@@ -1055,6 +1056,9 @@ static void stage2_map_prefault_idmap(struct kvm_pgtable_pte_ops *pte_ops,
 				(pa < ctx->addr) || (pa >= ctx->end)) {
 			/* We can write non-atomically: ptep isn't yet live. */
 			*ptep = pte;
+
+			if (counted)
+				ctx->mm_ops->get_page(ptep);
 		}
 	}
 }
@@ -1082,9 +1086,11 @@ static int stage2_map_walk_leaf(const struct kvm_pgtable_visit_ctx *ctx,
 	if (!childp)
 		return -ENOMEM;
 
-	if (pgt->flags & KVM_PGTABLE_S2_IDMAP) {
-		stage2_map_prefault_idmap(pte_ops, ctx, childp);
-	}
+	WARN_ON((pgt->flags & KVM_PGTABLE_S2_IDMAP) &&
+		pte_ops->pte_is_counted_cb(ctx->old, ctx->level));
+
+	if (pgt->flags & KVM_PGTABLE_S2_PREFAULT_BLOCK)
+		stage2_map_prefault_block(pte_ops, ctx, childp);
 
 	if (!stage2_try_break_pte(ctx, data->mmu)) {
 		mm_ops->put_page(childp);
@@ -1455,8 +1461,7 @@ int kvm_pgtable_stage2_wrprotect(struct kvm_pgtable *pgt, u64 addr, u64 size)
 {
 	return stage2_update_leaf_attrs(pgt, addr, size, 0,
 					KVM_PTE_LEAF_ATTR_LO_S2_S2AP_W,
-					NULL, NULL,
-					KVM_PGTABLE_WALK_IGNORE_EAGAIN);
+					NULL, NULL, 0);
 }
 
 kvm_pte_t kvm_pgtable_stage2_mkyoung(struct kvm_pgtable *pgt, u64 addr,
@@ -1544,8 +1549,7 @@ int kvm_pgtable_stage2_relax_perms(struct kvm_pgtable *pgt, u64 addr,
 
 	ret = stage2_update_leaf_attrs(pgt, addr, 1, set, clr, NULL, &level, flags);
 	if (!ret || ret == -EAGAIN)
-		kvm_call_hyp(__kvm_tlb_flush_vmid_ipa_nsh, pgt->mmu, addr,
-			     (ret == -EAGAIN) ? TLBI_TTL_UNKNOWN : level);
+		kvm_call_hyp(__kvm_tlb_flush_vmid_ipa_nsh, pgt->mmu, addr, level);
 	return ret;
 }
 

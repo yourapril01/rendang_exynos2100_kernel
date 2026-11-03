@@ -31,11 +31,19 @@
  */
 #define __TLBI_0(op, arg) asm (ARM64_ASM_PREAMBLE			       \
 			       "tlbi " #op "\n"				       \
+		   ALTERNATIVE("nop\n			nop",		       \
+			       "dsb ish\n		tlbi " #op,	       \
+			       ARM64_WORKAROUND_REPEAT_TLBI,		       \
+			       CONFIG_ARM64_WORKAROUND_REPEAT_TLBI)	       \
 			    : : )
 
 #define __TLBI_1(op, arg) asm (ARM64_ASM_PREAMBLE			       \
-			       "tlbi " #op ", %x0\n"			       \
-			    : : "rZ" (arg))
+			       "tlbi " #op ", %0\n"			       \
+		   ALTERNATIVE("nop\n			nop",		       \
+			       "dsb ish\n		tlbi " #op ", %0",     \
+			       ARM64_WORKAROUND_REPEAT_TLBI,		       \
+			       CONFIG_ARM64_WORKAROUND_REPEAT_TLBI)	       \
+			    : : "r" (arg))
 
 #define __TLBI_N(op, arg, n, ...) __TLBI_##n(op, arg)
 
@@ -80,38 +88,21 @@ static inline unsigned long get_trans_granule(void)
 	}
 }
 
-#ifdef CONFIG_ARM64_ERRATUM_4193714
-
-extern cpumask_t sme_active_cpus;
-
-void sme_do_dvmsync(const struct cpumask *mask);
+#ifdef CONFIG_ARM64_ERRATUM_SME_DVMSYNC
+void sme_do_dvmsync(void);
 
 static inline void sme_dvmsync(struct mm_struct *mm)
 {
-	if (!alternative_has_cap_unlikely(ARM64_WORKAROUND_4193714))
+	if (!cpus_have_final_cap(ARM64_WORKAROUND_SME_DVMSYNC))
+		return;
+	if (mm && !test_bit(ilog2(MMCF_SME_DVMSYNC), &mm->context.flags))
 		return;
 
-	sme_do_dvmsync(mm_cpumask(mm));
+	sme_do_dvmsync();
 }
-
-static inline void sme_dvmsync_batch(void)
-{
-	if (!alternative_has_cap_unlikely(ARM64_WORKAROUND_4193714))
-		return;
-
-	sme_do_dvmsync(&sme_active_cpus);
-}
-
 #else
-
-static inline void sme_dvmsync(struct mm_struct *mm)
-{
-}
-static inline void sme_dvmsync_batch(void)
-{
-}
-
-#endif /* CONFIG_ARM64_ERRATUM_4193714 */
+static inline void sme_dvmsync(struct mm_struct *mm) { }
+#endif
 
 /*
  * Level-based TLBI operations.
@@ -208,44 +199,29 @@ static inline void sme_dvmsync_batch(void)
 
 #define __repeat_tlbi_sync(op, arg...)						\
 do {										\
-	if (!alternative_has_cap_unlikely(ARM64_WORKAROUND_REPEAT_TLBI))	\
+	if (!alternative_has_cap_unlikely(ARM64_WORKAROUND_REPEAT_TLBI_SYNC))	\
 		break;								\
 	__tlbi(op, ##arg);							\
 	dsb(ish);								\
 } while (0)
 
-/*
- * Complete broadcast TLB maintenance issued by the host which invalidates
- * stage 1 information in the host's own translation regime.
- */
 static inline void __tlbi_sync_s1ish(struct mm_struct *mm)
 {
 	dsb(ish);
-	__repeat_tlbi_sync(vale1is, 0);
+	__repeat_tlbi_sync(vale1is, 0UL);
 	sme_dvmsync(mm);
-}
-
-static inline void __tlbi_sync_s1ish_batch(void)
-{
-	dsb(ish);
-	__repeat_tlbi_sync(vale1is, 0);
-	sme_dvmsync_batch();
 }
 
 static inline void __tlbi_sync_s1ish_kernel(void)
 {
 	dsb(ish);
-	__repeat_tlbi_sync(vale1is, 0);
+	__repeat_tlbi_sync(vale1is, 0UL);
 }
 
-/*
- * Complete broadcast TLB maintenance issued by hyp code which invalidates
- * stage 1 translation information in any translation regime.
- */
 static inline void __tlbi_sync_s1ish_hyp(void)
 {
 	dsb(ish);
-	__repeat_tlbi_sync(vale2is, 0);
+	__repeat_tlbi_sync(vale2is, 0UL);
 }
 
 /*
@@ -377,6 +353,15 @@ static inline void flush_tlb_page(struct vm_area_struct *vma,
 
 static inline bool arch_tlbbatch_should_defer(struct mm_struct *mm)
 {
+	/*
+	 * TLB flush deferral is not required on systems which are affected by
+	 * ARM64_WORKAROUND_REPEAT_TLBI, as __tlbi()/__tlbi_user() implementation
+	 * will have two consecutive TLBI instructions with a dsb(ish) in between
+	 * defeating the purpose (i.e save overall 'dsb ish' cost).
+	 */
+	if (alternative_has_cap_unlikely(ARM64_WORKAROUND_REPEAT_TLBI))
+		return false;
+
 	return true;
 }
 
@@ -410,7 +395,7 @@ static inline void arch_flush_tlb_batched_pending(struct mm_struct *mm)
  */
 static inline void arch_tlbbatch_flush(struct arch_tlbflush_unmap_batch *batch)
 {
-	__tlbi_sync_s1ish_batch();
+	__tlbi_sync_s1ish(NULL);
 }
 
 /*
@@ -492,23 +477,6 @@ do {									\
 #define __flush_s2_tlb_range_op(op, start, pages, stride, tlb_level) \
 	__flush_tlb_range_op(op, start, pages, stride, 0, tlb_level, false, kvm_lpa2_is_enabled());
 
-static inline bool __flush_tlb_range_limit_excess(unsigned long start,
-		unsigned long end, unsigned long pages, unsigned long stride)
-{
-	/*
-	 * When the system does not support TLB range based flush
-	 * operation, (MAX_DVM_OPS - 1) pages can be handled. But
-	 * with TLB range based operation, MAX_TLBI_RANGE_PAGES
-	 * pages can be handled.
-	 */
-	if ((!system_supports_tlb_range() &&
-	     (end - start) >= (MAX_DVM_OPS * stride)) ||
-	    pages > MAX_TLBI_RANGE_PAGES)
-		return true;
-
-	return false;
-}
-
 static inline void __flush_tlb_range_nosync(struct vm_area_struct *vma,
 				     unsigned long start, unsigned long end,
 				     unsigned long stride, bool last_level,
@@ -520,7 +488,15 @@ static inline void __flush_tlb_range_nosync(struct vm_area_struct *vma,
 	end = round_up(end, stride);
 	pages = (end - start) >> PAGE_SHIFT;
 
-	if (__flush_tlb_range_limit_excess(start, end, pages, stride)) {
+	/*
+	 * When not uses TLB range ops, we can handle up to
+	 * (MAX_DVM_OPS - 1) pages;
+	 * When uses TLB range ops, we can handle up to
+	 * MAX_TLBI_RANGE_PAGES pages.
+	 */
+	if ((!system_supports_tlb_range() &&
+	     (end - start) >= (MAX_DVM_OPS * stride)) ||
+	    pages > MAX_TLBI_RANGE_PAGES) {
 		flush_tlb_mm(vma->vm_mm);
 		return;
 	}

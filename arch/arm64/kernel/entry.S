@@ -35,6 +35,10 @@
 	.endr
 	.endm
 
+#ifdef CONFIG_SEC_DEBUG_EXCEPTION_STACK
+#define PRESERVE_STACK_SIZE	256
+#endif
+
 	.macro kernel_ventry, el:req, ht:req, regsize:req, label:req
 	.align 7
 .Lventry_start\@:
@@ -53,7 +57,15 @@
 .Lskip_tramp_vectors_cleanup\@:
 	.endif
 
+#ifdef CONFIG_SEC_DEBUG_EXCEPTION_STACK
+	.if	\el == 0
 	sub	sp, sp, #PT_REGS_SIZE
+	.else
+	sub	sp, sp, #(PT_REGS_SIZE+PRESERVE_STACK_SIZE)
+	.endif /* \el == 0 */
+#else
+	sub	sp, sp, #PT_REGS_SIZE
+#endif
 #ifdef CONFIG_VMAP_STACK
 	/*
 	 * Test whether the SP has overflowed, without corrupting a GPR.
@@ -276,7 +288,11 @@ alternative_else_nop_endif
 
 	scs_load_current
 	.else
+#ifdef CONFIG_SEC_DEBUG_EXCEPTION_STACK
+	add	x21, sp, #(PT_REGS_SIZE+PRESERVE_STACK_SIZE)
+#else
 	add	x21, sp, #PT_REGS_SIZE
+#endif
 	get_current_task tsk
 	.endif /* \el == 0 */
 	mrs	x22, elr_el1
@@ -445,7 +461,15 @@ alternative_else_nop_endif
 	.endif
 
 	ldr	lr, [sp, #S_LR]
+#ifdef CONFIG_SEC_DEBUG_EXCEPTION_STACK
+	.if	\el == 0
 	add	sp, sp, #PT_REGS_SIZE		// restore sp
+	.else
+	add	sp, sp, #(PT_REGS_SIZE+PRESERVE_STACK_SIZE)
+	.endif /* \el == 0 */
+#else
+	add	sp, sp, #PT_REGS_SIZE		// restore sp
+#endif
 
 	.if \el == 0
 	/* This must be after the last explicit memory access */
@@ -556,7 +580,11 @@ SYM_CODE_START_LOCAL(__bad_stack)
 	sub	sp, sp, #PT_REGS_SIZE
 	kernel_entry 1
 	mrs	x0, tpidr_el0
+#ifdef CONFIG_SEC_DEBUG_EXCEPTION_STACK
+	add	x0, x0, #(PT_REGS_SIZE+PRESERVE_STACK_SIZE)
+#else
 	add	x0, x0, #PT_REGS_SIZE
+#endif
 	str	x0, [sp, #S_SP]
 
 	/* Stash the regs for handle_bad_stack */
@@ -823,7 +851,6 @@ SYM_CODE_END(__bp_harden_el1_vectors)
  *
  */
 SYM_FUNC_START(cpu_switch_to)
-	save_and_disable_daif x11
 	mov	x10, #THREAD_CPU_CONTEXT
 	add	x8, x0, x10
 	mov	x9, sp
@@ -847,7 +874,6 @@ SYM_FUNC_START(cpu_switch_to)
 	ptrauth_keys_install_kernel x1, x8, x9, x10
 	scs_save x0
 	scs_load_current
-	restore_irq x11
 	ret
 SYM_FUNC_END(cpu_switch_to)
 NOKPROBE(cpu_switch_to)
@@ -874,7 +900,6 @@ NOKPROBE(ret_from_fork)
  * Calls func(regs) using this CPU's irq stack and shadow irq stack.
  */
 SYM_FUNC_START(call_on_irq_stack)
-	save_and_disable_daif x9
 #ifdef CONFIG_SHADOW_CALL_STACK
 	get_current_task x16
 	scs_save x16
@@ -889,10 +914,8 @@ SYM_FUNC_START(call_on_irq_stack)
 
 	/* Move to the new stack and call the function there */
 	add	sp, x16, #IRQ_STACK_SIZE
-	restore_irq x9
 	blr	x1
 
-	save_and_disable_daif x9
 	/*
 	 * Restore the SP from the FP, and restore the FP and LR from the frame
 	 * record.
@@ -900,7 +923,6 @@ SYM_FUNC_START(call_on_irq_stack)
 	mov	sp, x29
 	ldp	x29, x30, [sp], #16
 	scs_load_current
-	restore_irq x9
 	ret
 SYM_FUNC_END(call_on_irq_stack)
 NOKPROBE(call_on_irq_stack)

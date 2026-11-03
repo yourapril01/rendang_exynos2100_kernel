@@ -164,12 +164,11 @@ int topup_hyp_memcache_gfp(struct kvm_hyp_memcache *mc, unsigned long min_pages,
 static inline void init_hyp_memcache(struct kvm_hyp_memcache *mc)
 {
 	memset(mc, 0, sizeof(*mc));
-	mc->mapping = ZERO_SIZE_PTR; /* Prevent allocation, solely useful for stage2 memcache */
 }
 
 static inline void init_hyp_stage2_memcache(struct kvm_hyp_memcache *mc)
 {
-	memset(mc, 0, sizeof(*mc));
+	init_hyp_memcache(mc);
 	mc->flags = HYP_MEMCACHE_ACCOUNT_KMEMCG | HYP_MEMCACHE_ACCOUNT_STAGE2;
 }
 
@@ -258,7 +257,6 @@ struct kvm_s2_mmu {
 };
 
 struct kvm_arch_memory_slot {
-	u64 pkvm_pf_count;
 };
 
 /**
@@ -279,13 +277,11 @@ struct kvm_pinned_page {
 		struct rb_node	 	node;
 		struct list_head 	list_node;
 	};
-	struct page		*_page;
-	struct file		*file;
-	struct kvm_memory_slot	*slot;
-	u64			pfn;
+	struct page		*page;
 	u64			ipa;
 	u64			__subtree_last;
 	u8			order;
+	u16			pins;
 };
 
 struct kvm_pinned_page
@@ -294,8 +290,6 @@ struct kvm_pinned_page
 *kvm_pinned_pages_iter_next(struct kvm_pinned_page *ppage, u64 start, u64 end);
 void kvm_pinned_pages_remove(struct kvm_pinned_page *ppage,
 			     struct rb_root_cached *root);
-
-void pkvm_release_ppage(struct kvm_pinned_page *ppage, bool dirty);
 
 typedef unsigned int pkvm_handle_t;
 
@@ -398,8 +392,6 @@ struct kvm_arch {
 #define KVM_ARCH_FLAG_GUEST_HAS_SVE			9
 	/* Guest has bought into the MMIO guard extension */
 #define KVM_ARCH_FLAG_MMIO_GUARD			10
-	/* No further ID register changes possible */
-#define KVM_ARCH_FLAG_ID_REGS_FINAL			11
 	unsigned long flags;
 
 	/* VM-wide vCPU feature set */
@@ -695,19 +687,11 @@ struct kvm_host_data {
 		struct kvm_guest_debug_arch regs;
 		/* Statistical profiling extension */
 		u64 pmscr_el1;
-		u64 pmblimitr_el1;
 		/* Self-hosted trace */
 		u64 trfcr_el1;
-		u64 trblimitr_el1;
 		/* Values of trap registers for the host before guest entry. */
 		u64 mdcr_el2;
 	} host_debug_state;
-};
-
-enum kvm_psci_mem_protect_mode {
-	KVM_PSCI_MEM_PROTECT_AUTO,	/* Probe capabilities and call if supported */
-	KVM_PSCI_MEM_PROTECT_FORCE,	/* Enforce PSCI MEM_PROTECT handling */
-	KVM_PSCI_MEM_PROTECT_OFF,	/* Skip PSCI MEM_PROTECT handling */
 };
 
 struct kvm_host_psci_config {
@@ -723,9 +707,6 @@ struct kvm_host_psci_config {
 	bool psci_0_1_cpu_off_implemented;
 	bool psci_0_1_migrate_implemented;
 };
-
-extern enum kvm_psci_mem_protect_mode kvm_nvhe_sym(kvm_psci_mem_protect_mode);
-#define kvm_psci_mem_protect_mode CHOOSE_NVHE_SYM(kvm_psci_mem_protect_mode)
 
 extern struct kvm_host_psci_config kvm_nvhe_sym(kvm_host_psci_config);
 #define kvm_host_psci_config CHOOSE_NVHE_SYM(kvm_host_psci_config)
@@ -1149,9 +1130,6 @@ struct kvm_vcpu_arch {
 #else
 #define vcpu_has_ptrauth(vcpu)		false
 #endif
-
-#define kvm_id_regs_final(kvm)						\
-	test_bit(KVM_ARCH_FLAG_ID_REGS_FINAL, &(kvm)->arch.flags)
 
 #define vcpu_on_unsupported_cpu(vcpu)					\
 	vcpu_get_flag(vcpu, ON_UNSUPPORTED_CPU)
@@ -1626,7 +1604,7 @@ static inline bool __vcpu_has_feature(const struct kvm_arch *ka, int feature)
 #define kvm_vcpu_has_feature(k, f)	__vcpu_has_feature(&(k)->arch, (f))
 #define vcpu_has_feature(v, f)	__vcpu_has_feature(&(v)->kvm->arch, (f))
 
-#define kvm_vcpu_initialized(v) vcpu_get_flag(v, VCPU_INITIALIZED)
+#define kvm_vcpu_initialized(v) vcpu_get_flag(vcpu, VCPU_INITIALIZED)
 
 int kvm_trng_call(struct kvm_vcpu *vcpu);
 #ifdef CONFIG_KVM
@@ -1727,7 +1705,6 @@ void kvm_set_vm_id_reg(struct kvm *kvm, u32 reg, u64 val);
 #define HYP_ALLOC_MGT_IOMMU_ID		1
 
 unsigned long __pkvm_reclaim_hyp_alloc_mgt(unsigned long nr_pages);
-int __pkvm_topup_hyp_alloc_mgt_mc(unsigned long id, struct kvm_hyp_memcache *mc);
 int __pkvm_topup_hyp_alloc_mgt_gfp(unsigned long id, unsigned long nr_pages,
 				   unsigned long sz_alloc, gfp_t gfp);
 
@@ -1740,9 +1717,7 @@ struct kvm_iommu_driver {
 				   pkvm_handle_t *out_iommu, u32 *out_sid);
 	void *(*guest_alloc)(void *flags, unsigned long order);
 	void (*guest_free)(void *addr, void *flags, unsigned long order);
-	ANDROID_KABI_USE(
-		1, int (*get_iommu_endpoint)(struct of_phandle_args *iommu_spec,
-					     u64 *out_endpoint));
+	ANDROID_KABI_RESERVE(1);
 	ANDROID_KABI_RESERVE(2);
 	ANDROID_KABI_RESERVE(3);
 	ANDROID_KABI_RESERVE(4);
@@ -1759,10 +1734,6 @@ int kvm_iommu_init_hyp(struct kvm_iommu_ops *hyp_ops,
 int kvm_iommu_init_driver(void);
 void kvm_iommu_remove_driver(void);
 pkvm_handle_t kvm_get_iommu_id_by_of(struct device_node *np);
-int kvm_get_iommu_endpoint(struct of_phandle_args *iommu_spec, u64 *out_endpoint);
-
-struct page *kvm_iommu_cma_alloc(void);
-bool kvm_iommu_cma_release(struct page *p);
 
 int pkvm_iommu_suspend(struct device *dev);
 int pkvm_iommu_resume(struct device *dev);
@@ -1799,14 +1770,8 @@ static inline void kvm_iommu_sg_free(struct kvm_iommu_sg *sg, unsigned int nents
 int kvm_iommu_attach_dev(pkvm_handle_t iommu_id, pkvm_handle_t domain_id,
 			 unsigned int endpoint, unsigned int pasid,
 			 unsigned int ssid_bits, unsigned long flags);
-int kvm_iommu_attach_dev_nested(pkvm_handle_t iommu_id, pkvm_handle_t domain_id,
-				unsigned int endpoint, unsigned int pasid,
-				unsigned long flags, void *s1_desc_hva,
-				size_t s1_desc_size);
 int kvm_iommu_detach_dev(pkvm_handle_t iommu_id, pkvm_handle_t domain_id,
 			 unsigned int endpoint, unsigned int pasid);
-int kvm_iommu_detach_dev_nested(pkvm_handle_t iommu_id, pkvm_handle_t domain_id,
-				unsigned int endpoint, unsigned int pasid);
 int kvm_iommu_alloc_domain(pkvm_handle_t domain_id, int type);
 int kvm_iommu_free_domain(pkvm_handle_t domain_id);
 int kvm_iommu_map_pages(pkvm_handle_t domain_id, unsigned long iova,
@@ -1815,13 +1780,9 @@ int kvm_iommu_map_pages(pkvm_handle_t domain_id, unsigned long iova,
 size_t kvm_iommu_unmap_pages(pkvm_handle_t domain_id, unsigned long iova,
 			     size_t pgsize, size_t pgcount);
 phys_addr_t kvm_iommu_iova_to_phys(pkvm_handle_t domain_id, unsigned long iova);
-int kvm_iommu_iotlb_sync_map(pkvm_handle_t domain_id, unsigned long iova, size_t size);
 size_t kvm_iommu_map_sg(pkvm_handle_t domain_id, struct kvm_iommu_sg *sg,
 			unsigned long iova, unsigned int nent,
 			unsigned int prot, gfp_t gfp);
-int kvm_iommu_iotlb_inv_nested_domain(pkvm_handle_t domain_id, unsigned long iova, size_t size,
-				      size_t granule, bool leaf);
-int kvm_iommu_nested_cfg_sync(pkvm_handle_t iommu_id, void *cmd_desc_hva, size_t cmd_desc_size);
 #endif
 
 int kvm_iommu_share_hyp_sg(struct kvm_iommu_sg *sg, unsigned int nents);

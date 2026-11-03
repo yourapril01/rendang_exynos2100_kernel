@@ -89,7 +89,6 @@ static bool has_host_signalled;
 
 static struct ffa_handle *spm_handles, *spm_free_handle;
 static u32 num_spm_handles;
-size_t ffa_max_nr_constituents = KVM_FFA_MAX_NR_CONSTITUENTS;
 
 static DEFINE_HYP_SPINLOCK(version_lock);
 static DEFINE_HYP_SPINLOCK(kvm_ffa_hyp_lock);
@@ -112,29 +111,33 @@ static struct kvm_ffa_buffers *ffa_get_buffers(struct pkvm_hyp_vcpu *hyp_vcpu)
 	return &pkvm_hyp_vcpu_to_hyp_vm(hyp_vcpu)->ffa_buf;
 }
 
-int __pkvm_ffa_unmap_on_lend;
+DECLARE_STATIC_KEY_FALSE(kvm_ffa_unmap_on_lend);
 
-static struct ffa_handle *ffa_host_alloc_handle(void)
+static int ffa_host_store_handle(u64 ffa_handle, bool is_lend)
 {
 	u32 i;
-	struct ffa_handle *handle;
+	struct ffa_handle *free_handle = NULL;
 
-	if (spm_free_handle) {
-		WARN_ON(spm_free_handle < spm_handles ||
-			spm_free_handle >= (spm_handles + num_spm_handles));
-		handle = spm_free_handle;
-		spm_free_handle = NULL;
-		return handle;
+	if (!static_branch_unlikely(&kvm_ffa_unmap_on_lend))
+		return 0;
+
+	if (spm_free_handle >= spm_handles &&
+	    spm_free_handle < (spm_handles + num_spm_handles)) {
+		free_handle = spm_free_handle;
+	} else {
+		for (i = 0; i < num_spm_handles; i++)
+			if (spm_handles[i].handle == FFA_INVALID_SPM_HANDLE)
+				break;
+
+		if (i == num_spm_handles)
+			return -ENOSPC;
+
+		free_handle = &spm_handles[i];
 	}
 
-	for (i = 0; i < num_spm_handles; i++)
-		if (spm_handles[i].handle == FFA_INVALID_SPM_HANDLE)
-			break;
-
-	if (i == num_spm_handles)
-		return NULL;
-
-	return &spm_handles[i];
+	free_handle->handle = ffa_handle;
+	free_handle->is_lend = is_lend;
+	return 0;
 }
 
 static struct ffa_handle *ffa_host_get_handle(u64 ffa_handle)
@@ -159,73 +162,41 @@ static int ffa_host_clear_handle(u64 ffa_handle)
 	return 0;
 }
 
-static void ffa_to_smccc_error(struct arm_smccc_1_2_regs *res, u64 ffa_errno)
+static void ffa_to_smccc_error(struct arm_smccc_res *res, u64 ffa_errno)
 {
-	*res = (struct arm_smccc_1_2_regs) {
+	*res = (struct arm_smccc_res) {
 		.a0	= FFA_ERROR,
 		.a2	= ffa_errno,
 	};
 }
 
-static void ffa_to_smccc_res_prop(struct arm_smccc_1_2_regs *res, int ret, u64 prop)
+static void ffa_to_smccc_res_prop(struct arm_smccc_res *res, int ret, u64 prop)
 {
 	if (ret == FFA_RET_SUCCESS) {
-		*res = (struct arm_smccc_1_2_regs) { .a0 = FFA_SUCCESS,
-						     .a2 = prop };
+		*res = (struct arm_smccc_res) { .a0 = FFA_SUCCESS,
+						.a2 = prop };
 	} else {
 		ffa_to_smccc_error(res, ret);
 	}
 }
 
-static void ffa_to_smccc_res(struct arm_smccc_1_2_regs *res, int ret)
+static void ffa_to_smccc_res(struct arm_smccc_res *res, int ret)
 {
 	ffa_to_smccc_res_prop(res, ret, 0);
 }
 
 static void ffa_set_retval(struct kvm_cpu_context *ctxt,
-			   struct arm_smccc_1_2_regs *res)
+			   struct arm_smccc_res *res)
 {
 	cpu_reg(ctxt, 0) = res->a0;
 	cpu_reg(ctxt, 1) = res->a1;
 	cpu_reg(ctxt, 2) = res->a2;
 	cpu_reg(ctxt, 3) = res->a3;
-	cpu_reg(ctxt, 4) = res->a4;
-	cpu_reg(ctxt, 5) = res->a5;
-	cpu_reg(ctxt, 6) = res->a6;
-	cpu_reg(ctxt, 7) = res->a7;
-
-	/*
-	 * DEN0028C 2.6: SMC32/HVC32 call from aarch64 must preserve x8-x30.
-	 *
-	 * In FF-A 1.2, we cannot rely on the function ID sent by the caller to
-	 * detect 32-bit calls because the CPU cycle management interfaces (e.g.
-	 * FFA_MSG_WAIT, FFA_RUN) are 32-bit only but can have 64-bit responses.
-	 *
-	 * FFA-1.3 introduces 64-bit variants of the CPU cycle management
-	 * interfaces. Moreover, FF-A 1.3 clarifies that SMC32 direct requests
-	 * complete with SMC32 direct reponses which *should* allow us use the
-	 * function ID sent by the caller to determine whether to return x8-x17.
-	 *
-	 * Note that we also cannot rely on function IDs in the response.
-	 *
-	 * Given the above, assume SMC64 and send back x0-x17 unconditionally
-	 * as the passthrough code (__kvm_hyp_host_forward_smc) does the same.
-	 */
-	cpu_reg(ctxt, 8) = res->a8;
-	cpu_reg(ctxt, 9) = res->a9;
-	cpu_reg(ctxt, 10) = res->a10;
-	cpu_reg(ctxt, 11) = res->a11;
-	cpu_reg(ctxt, 12) = res->a12;
-	cpu_reg(ctxt, 13) = res->a13;
-	cpu_reg(ctxt, 14) = res->a14;
-	cpu_reg(ctxt, 15) = res->a15;
-	cpu_reg(ctxt, 16) = res->a16;
-	cpu_reg(ctxt, 17) = res->a17;
 }
 
 static int ffa_map_hyp_buffers(u64 ffa_page_count)
 {
-	struct arm_smccc_1_2_regs res;
+	struct arm_smccc_res res;
 
 	/*
 	 * Ensure that the read of `has_hyp_ffa_buffer_mapped` is visible
@@ -234,12 +205,12 @@ static int ffa_map_hyp_buffers(u64 ffa_page_count)
 	if (smp_load_acquire(&has_hyp_ffa_buffer_mapped))
 		return 0;
 
-	nvhe_arm_smccc_1_2_smc(&(struct arm_smccc_1_2_regs) {
-		.a0 = FFA_FN64_RXTX_MAP,
-		.a1 = hyp_virt_to_phys(hyp_buffers.tx),
-		.a2 = hyp_virt_to_phys(hyp_buffers.rx),
-		.a3 = ffa_page_count,
-	}, &res);
+	arm_smccc_1_1_smc(FFA_FN64_RXTX_MAP,
+			  hyp_virt_to_phys(hyp_buffers.tx),
+			  hyp_virt_to_phys(hyp_buffers.rx),
+			  ffa_page_count,
+			  0, 0, 0, 0,
+			  &res);
 	if (res.a0 != FFA_SUCCESS)
 		return res.a2;
 
@@ -254,7 +225,7 @@ static int ffa_map_hyp_buffers(u64 ffa_page_count)
 
 static int ffa_unmap_hyp_buffers(void)
 {
-	struct arm_smccc_1_2_regs res;
+	struct arm_smccc_res res;
 
 	/*
 	 * Ensure that the read of `has_hyp_ffa_buffer_mapped` is visible
@@ -263,10 +234,10 @@ static int ffa_unmap_hyp_buffers(void)
 	if (!smp_load_acquire(&has_hyp_ffa_buffer_mapped))
 		return 0;
 
-	nvhe_arm_smccc_1_2_smc(&(struct arm_smccc_1_2_regs) {
-		.a0 = FFA_RXTX_UNMAP,
-		.a1 = HOST_FFA_ID,
-	}, &res);
+	arm_smccc_1_1_smc(FFA_RXTX_UNMAP,
+			  HOST_FFA_ID,
+			  0, 0, 0, 0, 0, 0,
+			  &res);
 	if (res.a0 != FFA_SUCCESS)
 		return res.a2;
 
@@ -279,65 +250,55 @@ static int ffa_unmap_hyp_buffers(void)
 	return FFA_RET_SUCCESS;
 }
 
-static void ffa_mem_frag_tx(struct arm_smccc_1_2_regs *res, u32 handle_lo,
+static void ffa_mem_frag_tx(struct arm_smccc_res *res, u32 handle_lo,
 			     u32 handle_hi, u32 fraglen, u32 endpoint_id)
 {
-	nvhe_arm_smccc_1_2_smc(&(struct arm_smccc_1_2_regs) {
-		.a0 = FFA_MEM_FRAG_TX,
-		.a1 = handle_lo,
-		.a2 = handle_hi,
-		.a3 = fraglen,
-		.a4 = endpoint_id,
-	}, res);
+	arm_smccc_1_1_smc(FFA_MEM_FRAG_TX,
+			  handle_lo, handle_hi, fraglen, endpoint_id,
+			  0, 0, 0,
+			  res);
 }
 
-static void ffa_mem_frag_rx(struct arm_smccc_1_2_regs *res, u32 handle_lo,
+static void ffa_mem_frag_rx(struct arm_smccc_res *res, u32 handle_lo,
 			     u32 handle_hi, u32 fragoff)
 {
-	nvhe_arm_smccc_1_2_smc(&(struct arm_smccc_1_2_regs) {
-		.a0 = FFA_MEM_FRAG_RX,
-		.a1 = handle_lo,
-		.a2 = handle_hi,
-		.a3 = fragoff,
-		.a4 = HOST_FFA_ID,
-	}, res);
+	arm_smccc_1_1_smc(FFA_MEM_FRAG_RX,
+			  handle_lo, handle_hi, fragoff, HOST_FFA_ID,
+			  0, 0, 0,
+			  res);
 }
 
-static void ffa_mem_xfer(struct arm_smccc_1_2_regs *res, u64 func_id, u32 len,
+static void ffa_mem_xfer(struct arm_smccc_res *res, u64 func_id, u32 len,
 			  u32 fraglen)
 {
-	nvhe_arm_smccc_1_2_smc(&(struct arm_smccc_1_2_regs) {
-		.a0 = func_id,
-		.a1 = len,
-		.a2 = fraglen,
-	}, res);
+	arm_smccc_1_1_smc(func_id, len, fraglen,
+			  0, 0, 0, 0, 0,
+			  res);
 }
 
-static void ffa_mem_reclaim(struct arm_smccc_1_2_regs *res, u32 handle_lo,
+static void ffa_mem_reclaim(struct arm_smccc_res *res, u32 handle_lo,
 			     u32 handle_hi, u32 flags)
 {
-	nvhe_arm_smccc_1_2_smc(&(struct arm_smccc_1_2_regs) {
-		.a0 = FFA_MEM_RECLAIM,
-		.a1 = handle_lo,
-		.a2 = handle_hi,
-		.a3 = flags,
-	}, res);
+	arm_smccc_1_1_smc(FFA_MEM_RECLAIM,
+			  handle_lo, handle_hi, flags,
+			  0, 0, 0, 0,
+			  res);
 }
 
-static void ffa_retrieve_req(struct arm_smccc_1_2_regs *res, u32 len)
+static void ffa_retrieve_req(struct arm_smccc_res *res, u32 len)
 {
-	nvhe_arm_smccc_1_2_smc(&(struct arm_smccc_1_2_regs) {
-		.a0 = FFA_FN64_MEM_RETRIEVE_REQ,
-		.a1 = len,
-		.a2 = len,
-	}, res);
+	arm_smccc_1_1_smc(FFA_FN64_MEM_RETRIEVE_REQ,
+			  len, len,
+			  0, 0, 0, 0, 0,
+			  res);
 }
 
-static void ffa_rx_release(struct arm_smccc_1_2_regs *res)
+static void ffa_rx_release(struct arm_smccc_res *res)
 {
-	nvhe_arm_smccc_1_2_smc(&(struct arm_smccc_1_2_regs) {
-		.a0 = FFA_RX_RELEASE,
-	}, res);
+	arm_smccc_1_1_smc(FFA_RX_RELEASE,
+			  0, 0,
+			  0, 0, 0, 0, 0,
+			  res);
 }
 
 static int parse_vm_availability_resp(u32 partition_sz, u32 count)
@@ -392,7 +353,7 @@ static int kvm_notify_vm_availability(uint16_t vm_handle, struct kvm_ffa_buffers
 				      u32 availability_msg)
 {
 	int i;
-	struct arm_smccc_1_2_regs res;
+	struct arm_smccc_res res;
 	u64 avail_bit = availability_msg != FFA_VM_DESTRUCTION_MSG;
 
 	for (i = 0; i < num_vm_avail_sps; i++) {
@@ -429,11 +390,7 @@ static int kvm_notify_vm_availability(uint16_t vm_handle, struct kvm_ffa_buffers
 		 * Some TEEs return NOT_SUPPORTED instead.
 		 * If that happens, ignore the error and continue.
 		 */
-		res = (struct arm_smccc_1_2_regs) {
-			.a0 = FFA_RUN,
-			.a1 = dest,
-		};
-		nvhe_arm_smccc_1_2_smc(&res, &res);
+		arm_smccc_1_1_smc(FFA_RUN, dest, 0, 0, 0, 0, 0, 0, &res);
 		if (res.a0 == FFA_ERROR && (int)res.a2 != FFA_RET_NOT_SUPPORTED)
 			return ffa_to_linux_errno(res.a2);
 		else if (res.a0 == FFA_INTERRUPT)
@@ -452,15 +409,10 @@ static int kvm_notify_vm_availability(uint16_t vm_handle, struct kvm_ffa_buffers
 			 * we will never retry the creation message, and the SP
 			 * will probably leak its state for the pending VM.
 			 */
-			res = (struct arm_smccc_1_2_regs) {
-				.a0 = FFA_MSG_SEND_DIRECT_REQ,
-				.a1 = vm_avail_sps[i].sp_id,
-				.a2 = FFA_VM_CREATION_MSG,
-				.a3 = HANDLE_LOW(FFA_INVALID_HANDLE),
-				.a4 = HANDLE_HIGH(FFA_INVALID_HANDLE),
-				.a5 = vm_handle,
-			};
-			nvhe_arm_smccc_1_2_smc(&res, &res);
+			arm_smccc_1_1_smc(FFA_MSG_SEND_DIRECT_REQ, vm_avail_sps[i].sp_id,
+					  FFA_VM_CREATION_MSG, HANDLE_LOW(FFA_INVALID_HANDLE),
+					  HANDLE_HIGH(FFA_INVALID_HANDLE), vm_handle, 0, 0,
+					  &res);
 
 			if (res.a0 != FFA_MSG_SEND_DIRECT_RESP)
 				return -EINVAL;
@@ -471,15 +423,10 @@ static int kvm_notify_vm_availability(uint16_t vm_handle, struct kvm_ffa_buffers
 			ffa_buf->vm_creating_bitmap &= ~sp_mask;
 		}
 
-		res = (struct arm_smccc_1_2_regs) {
-				.a0 = FFA_MSG_SEND_DIRECT_REQ,
-				.a1 = vm_avail_sps[i].sp_id,
-				.a2 = availability_msg,
-				.a3 = HANDLE_LOW(FFA_INVALID_HANDLE),
-				.a4 = HANDLE_HIGH(FFA_INVALID_HANDLE),
-				.a5 = vm_handle,
-			};
-		nvhe_arm_smccc_1_2_smc(&res, &res);
+		arm_smccc_1_1_smc(FFA_MSG_SEND_DIRECT_REQ, vm_avail_sps[i].sp_id,
+				  availability_msg, HANDLE_LOW(FFA_INVALID_HANDLE),
+				  HANDLE_HIGH(FFA_INVALID_HANDLE), vm_handle, 0, 0,
+				  &res);
 		if (res.a0 != FFA_MSG_SEND_DIRECT_RESP)
 			return -EINVAL;
 
@@ -504,7 +451,7 @@ static int kvm_notify_vm_availability(uint16_t vm_handle, struct kvm_ffa_buffers
 	return 0;
 }
 
-static void do_ffa_rxtx_map(struct arm_smccc_1_2_regs *res,
+static void do_ffa_rxtx_map(struct arm_smccc_res *res,
 			    struct kvm_cpu_context *ctxt,
 			    struct pkvm_hyp_vcpu *hyp_vcpu)
 {
@@ -586,32 +533,6 @@ err_unmap:
 	goto out_unlock;
 }
 
-static int __handle_mem_protect_err(struct pkvm_hyp_vcpu *hyp_vcpu, u64 ipa, int ret)
-{
-	struct kvm_hyp_req *req;
-
-	switch (ret) {
-	case -EFAULT:
-		req = pkvm_hyp_req_reserve(hyp_vcpu, KVM_HYP_REQ_TYPE_MAP);
-		if (!req)
-			return -ENOSPC;
-
-		req->map.guest_ipa = ipa;
-		req->map.size = PAGE_SIZE;
-		break;
-	case -E2BIG:
-		req = pkvm_hyp_req_reserve(hyp_vcpu, KVM_HYP_REQ_TYPE_SPLIT);
-		if (!req)
-			return -ENOSPC;
-
-		req->split.guest_ipa = ALIGN_DOWN(ipa, PMD_SIZE);
-		req->split.size = PMD_SIZE;
-		break;
-	}
-
-	return ret;
-}
-
 static int do_ffa_rxtx_guest_map(struct kvm_cpu_context *ctxt, struct pkvm_hyp_vcpu *hyp_vcpu)
 {
 	DECLARE_REG(phys_addr_t, tx, ctxt, 1);
@@ -620,6 +541,7 @@ static int do_ffa_rxtx_guest_map(struct kvm_cpu_context *ctxt, struct pkvm_hyp_v
 	int ret = 0;
 	u64 rx_va, tx_va;
 	struct kvm_ffa_buffers *ffa_buf;
+	struct kvm_hyp_req *req;
 
 	if (npages != (KVM_FFA_MBOX_NR_PAGES * PAGE_SIZE) / FFA_PAGE_SIZE)
 		return -EINVAL;
@@ -650,15 +572,26 @@ out_unlock:
 	hyp_spin_unlock(&kvm_ffa_hyp_lock);
 	return ret;
 out_err_with_tx:
-	WARN_ON(__pkvm_guest_unshare_hyp_page(pkvm_hyp_vcpu_to_hyp_vm(hyp_vcpu), tx));
+	WARN_ON(__pkvm_guest_unshare_hyp_page(hyp_vcpu, tx));
 out_err:
-	ret = __handle_mem_protect_err(hyp_vcpu, tx, ret);
-	ret = __handle_mem_protect_err(hyp_vcpu, rx, ret);
+	if (ret == -EFAULT) {
+		req = pkvm_hyp_req_reserve(hyp_vcpu, KVM_HYP_REQ_TYPE_MAP);
+		if (!req || !pkvm_hyp_req_reserve(hyp_vcpu, KVM_HYP_REQ_TYPE_MAP))
+			return -ENOSPC;
+
+		req->map.guest_ipa = tx;
+		req->map.size = PAGE_SIZE;
+
+		req++;
+
+		req->map.guest_ipa = rx;
+		req->map.size = PAGE_SIZE;
+	}
 
 	return ret;
 }
 
-static void do_ffa_rxtx_unmap(struct arm_smccc_1_2_regs *res,
+static void do_ffa_rxtx_unmap(struct arm_smccc_res *res,
 			      struct kvm_cpu_context *ctxt,
 			      struct pkvm_hyp_vcpu *hyp_vcpu)
 {
@@ -687,10 +620,8 @@ static void do_ffa_rxtx_unmap(struct arm_smccc_1_2_regs *res,
 
 		ffa_unmap_hyp_buffers();
 	} else {
-		struct pkvm_hyp_vm *vm = pkvm_hyp_vcpu_to_hyp_vm(hyp_vcpu);
-
-		WARN_ON(__pkvm_guest_unshare_hyp_page(vm, ffa_buf->tx_ipa));
-		WARN_ON(__pkvm_guest_unshare_hyp_page(vm, ffa_buf->rx_ipa));
+		WARN_ON(__pkvm_guest_unshare_hyp_page(hyp_vcpu, ffa_buf->tx_ipa));
+		WARN_ON(__pkvm_guest_unshare_hyp_page(hyp_vcpu, ffa_buf->rx_ipa));
 	}
 
 	ffa_buf->rx = NULL;
@@ -713,10 +644,10 @@ static u32 __ffa_host_share_ranges(struct ffa_mem_region_addr_range *ranges,
 		u64 sz = (u64)range->pg_cnt * FFA_PAGE_SIZE;
 		u64 pfn = hyp_phys_to_pfn(range->address);
 
-		if (!PAGE_ALIGNED(sz | range->address))
+		if (!PAGE_ALIGNED(sz))
 			break;
 
-		if (pkvm_ffa_unmap_on_lend() && is_lend)
+		if (static_branch_unlikely(&kvm_ffa_unmap_on_lend) && is_lend)
 			ret = __pkvm_host_donate_ffa(pfn, sz / PAGE_SIZE);
 		else
 			ret = __pkvm_host_share_ffa(pfn, sz / PAGE_SIZE);
@@ -743,10 +674,10 @@ static u32 __ffa_host_unshare_ranges(struct ffa_mem_region_addr_range *ranges,
 		u64 sz = (u64)range->pg_cnt * FFA_PAGE_SIZE;
 		u64 pfn = hyp_phys_to_pfn(range->address);
 
-		if (!PAGE_ALIGNED(sz | range->address))
+		if (!PAGE_ALIGNED(sz))
 			break;
 
-		if (pkvm_ffa_unmap_on_lend() && is_lend)
+		if (static_branch_unlikely(&kvm_ffa_unmap_on_lend) && is_lend)
 			ret = __pkvm_host_reclaim_ffa(pfn, sz / PAGE_SIZE);
 		else
 
@@ -776,11 +707,10 @@ static int ffa_store_translation(struct ffa_mem_transfer *transfer, u64 ipa, phy
 static void ffa_guest_unshare_ranges(struct pkvm_hyp_vcpu *vcpu,
 				     struct ffa_mem_transfer *transfer)
 {
-	struct pkvm_hyp_vm *vm = pkvm_hyp_vcpu_to_hyp_vm(vcpu);
 	struct ffa_translation *translation, *tmp;
 
 	list_for_each_entry_safe(translation, tmp, &transfer->translations, node) {
-		WARN_ON(__pkvm_guest_unshare_ffa_page(vm, translation->ipa));
+		WARN_ON(__pkvm_guest_unshare_ffa_page(vcpu, translation->ipa));
 		list_del(&translation->node);
 		hyp_free(translation);
 	}
@@ -792,12 +722,11 @@ static int ffa_guest_share_ranges(struct ffa_mem_region_addr_range *ranges,
 				  size_t reg_len,
 				  struct ffa_mem_transfer *transfer)
 {
-	struct pkvm_hyp_vm *vm = pkvm_hyp_vcpu_to_hyp_vm(vcpu);
 	struct ffa_mem_region_addr_range *range;
 	struct ffa_mem_region_addr_range *buf = out_region->constituents;
 	int i, j, ret;
 	u32 mem_region_idx = 0;
-	u64 ipa, pa, offset;
+	u64 ipa, pa;
 
 	for (i = 0; i < nranges; i++) {
 		range = &ranges[i];
@@ -807,20 +736,14 @@ static int ffa_guest_share_ranges(struct ffa_mem_region_addr_range *ranges,
 				goto unshare;
 			}
 
-			if (check_mul_overflow(j, PAGE_SIZE, &offset) ||
-			    check_add_overflow(range->address, offset, &ipa)) {
-				ret = -EINVAL;
-				goto unshare;
-			}
-
-			ret = __handle_mem_protect_err(vcpu, ipa,
-					__pkvm_guest_share_ffa_page(vcpu, ipa, &pa));
+			ipa = range->address + PAGE_SIZE * j;
+			ret = __pkvm_guest_share_ffa_page(vcpu, ipa, &pa);
 			if (ret)
 				goto unshare;
 
 			ret = ffa_store_translation(transfer, ipa, pa);
 			if (ret) {
-				WARN_ON(__pkvm_guest_unshare_ffa_page(vm, ipa));
+				WARN_ON(__pkvm_guest_unshare_ffa_page(vcpu, ipa));
 				goto unshare;
 			}
 
@@ -871,7 +794,7 @@ static int ffa_host_unshare_ranges(struct ffa_mem_region_addr_range *ranges,
 	return ret;
 }
 
-static void do_ffa_mem_frag_tx(struct arm_smccc_1_2_regs *res,
+static void do_ffa_mem_frag_tx(struct arm_smccc_res *res,
 			       struct kvm_cpu_context *ctxt,
 			       struct pkvm_hyp_vcpu *hyp_vcpu)
 {
@@ -902,7 +825,7 @@ static void do_ffa_mem_frag_tx(struct arm_smccc_1_2_regs *res,
 	memcpy(buf, ffa_buf->tx, fraglen);
 	nr_ranges = fraglen / sizeof(*buf);
 
-	if (pkvm_ffa_unmap_on_lend()) {
+	if (static_branch_unlikely(&kvm_ffa_unmap_on_lend)) {
 		entry = ffa_host_get_handle(host_handle);
 		if (!entry) {
 			ffa_to_smccc_error(res, FFA_RET_INVALID_PARAMETERS);
@@ -914,9 +837,6 @@ static void do_ffa_mem_frag_tx(struct arm_smccc_1_2_regs *res,
 
 	ret = ffa_host_share_ranges(buf, nr_ranges, is_lend);
 	if (ret) {
-		struct ffa_mem_transfer *transfer = __pkvm_get_vm_ffa_transfer(host_handle);
-		WARN_ON(transfer);
-
 		/*
 		 * We're effectively aborting the transaction, so we need
 		 * to restore the global state back to what it was prior to
@@ -965,7 +885,7 @@ static bool is_page_count_valid(struct ffa_composite_mem_region *reg,
 }
 
 static int __do_ffa_mem_xfer(const u64 func_id,
-			     struct arm_smccc_1_2_regs *res,
+			     struct arm_smccc_res *res,
 			     struct kvm_cpu_context *ctxt,
 			     struct pkvm_hyp_vcpu *hyp_vcpu)
 {
@@ -977,13 +897,11 @@ static int __do_ffa_mem_xfer(const u64 func_id,
 	struct ffa_composite_mem_region *reg, *temp_reg;
 	struct ffa_mem_region *buf;
 	struct kvm_ffa_buffers *ffa_buf;
-	u32 offset, nr_ranges, checked_offset, em_mem_access_off;
+	u32 offset, nr_ranges;
 	int ret = 0;
 	struct ffa_mem_transfer *transfer = NULL;
 	u64 ffa_handle;
 	bool is_lend = func_id == FFA_FN64_MEM_LEND;
-	struct ffa_handle *handle = NULL;
-	size_t mem_region_len = FFA_MEM_REGION_SZ(hyp_ffa_version);
 
 	if (addr_mbz || npages_mbz || fraglen > len ||
 	    fraglen > KVM_FFA_MBOX_NR_PAGES * PAGE_SIZE) {
@@ -991,7 +909,8 @@ static int __do_ffa_mem_xfer(const u64 func_id,
 		return 0;
 	}
 
-	if (fraglen < mem_region_len + ffa_emad_size_get(hyp_ffa_version)) {
+	if (fraglen < sizeof(struct ffa_mem_region) +
+		      sizeof(struct ffa_mem_region_attributes)) {
 		ffa_to_smccc_error(res, FFA_RET_INVALID_PARAMETERS);
 		return 0;
 	}
@@ -1025,25 +944,15 @@ static int __do_ffa_mem_xfer(const u64 func_id,
 	buf = hyp_buffers.tx;
 	memcpy(buf, ffa_buf->tx, fraglen);
 
-	em_mem_access_off = ffa_mem_desc_offset(buf, 0, hyp_ffa_version);
-	if ((u64)em_mem_access_off + ffa_emad_size_get(hyp_ffa_version) > fraglen) {
-		ffa_to_smccc_error(res, FFA_RET_INVALID_PARAMETERS);
-		goto out_unlock;
-	}
-
-	ep_mem_access = (void *)buf + em_mem_access_off;
+	ep_mem_access = (void *)buf +
+			ffa_mem_desc_offset(buf, 0, hyp_ffa_version);
 	offset = ep_mem_access->composite_off;
 	if (!offset || buf->ep_count != 1 || buf->sender_id != hyp_vcpu_to_ffa_handle(hyp_vcpu)) {
 		ffa_to_smccc_error(res, FFA_RET_INVALID_PARAMETERS);
 		goto out_unlock;
 	}
 
-	if (check_add_overflow(offset, sizeof(struct ffa_composite_mem_region), &checked_offset)) {
-		ret = FFA_RET_INVALID_PARAMETERS;
-		goto out_unlock;
-	}
-
-	if (fraglen < checked_offset) {
+	if (fraglen < offset + sizeof(struct ffa_composite_mem_region)) {
 		ffa_to_smccc_error(res, FFA_RET_INVALID_PARAMETERS);
 		goto out_unlock;
 	}
@@ -1063,7 +972,7 @@ static int __do_ffa_mem_xfer(const u64 func_id,
 		}
 
 		size_t translated_sz = reg->total_pg_cnt * sizeof(struct ffa_mem_region_addr_range)
-			+ checked_offset;
+			+ offset;
 		if (translated_sz > PAGE_SIZE) {
 			ffa_to_smccc_error(res, FFA_RET_INVALID_PARAMETERS);
 			goto out_unlock;
@@ -1093,14 +1002,6 @@ static int __do_ffa_mem_xfer(const u64 func_id,
 	if (ret)
 		goto out_unlock;
 
-	if (!hyp_vcpu && pkvm_ffa_unmap_on_lend()) {
-		handle = ffa_host_alloc_handle();
-		if (!handle) {
-			ret = -ENOMEM;
-			goto err_unshare;
-		}
-	}
-
 	ffa_mem_xfer(res, func_id, len, fraglen);
 	if (fraglen != len) {
 		if (res->a0 != FFA_MEM_FRAG_RX)
@@ -1119,9 +1020,10 @@ static int __do_ffa_mem_xfer(const u64 func_id,
 	if (hyp_vcpu && transfer) {
 		transfer->ffa_handle = ffa_handle;
 		list_add(&transfer->node, &ffa_buf->xfer_list);
-	} else if (handle) {
-		handle->handle = ffa_handle;
-		handle->is_lend = is_lend;
+	} else if (!hyp_vcpu) {
+		ret = ffa_host_store_handle(ffa_handle, is_lend);
+		if (ret)
+			goto err_unshare;
 	}
 	hyp_spin_unlock(&kvm_ffa_hyp_lock);
 	return 0;
@@ -1156,7 +1058,7 @@ struct ffa_mem_transfer *find_transfer_by_handle(u64 ffa_handle, struct kvm_ffa_
 	return NULL;
 }
 
-static void do_ffa_mem_reclaim(struct arm_smccc_1_2_regs *res,
+static void do_ffa_mem_reclaim(struct arm_smccc_res *res,
 			       struct kvm_cpu_context *ctxt,
 			       struct pkvm_hyp_vcpu *hyp_vcpu)
 {
@@ -1165,7 +1067,7 @@ static void do_ffa_mem_reclaim(struct arm_smccc_1_2_regs *res,
 	DECLARE_REG(u32, flags, ctxt, 3);
 	struct ffa_mem_region_attributes *ep_mem_access;
 	struct ffa_composite_mem_region *reg;
-	u32 offset, len, fraglen, fragoff, em_mem_access_off;
+	u32 offset, len, fraglen, fragoff;
 	struct ffa_mem_region *buf;
 	int ret = 0;
 	u64 handle;
@@ -1192,7 +1094,7 @@ static void do_ffa_mem_reclaim(struct arm_smccc_1_2_regs *res,
 		/* Prevent the host from replicating a transfer handle used by the guest */
 		WARN_ON(transfer);
 
-		if (pkvm_ffa_unmap_on_lend()) {
+		if (static_branch_unlikely(&kvm_ffa_unmap_on_lend)) {
 			entry = ffa_host_get_handle(handle);
 			if (!entry) {
 				ret = FFA_RET_INVALID_PARAMETERS;
@@ -1216,22 +1118,16 @@ static void do_ffa_mem_reclaim(struct arm_smccc_1_2_regs *res,
 	len = res->a1;
 	fraglen = res->a2;
 
-	em_mem_access_off = ffa_mem_desc_offset(buf, 0, hyp_ffa_version);
-	if ((u64)em_mem_access_off + ffa_emad_size_get(hyp_ffa_version) > fraglen) {
-		ret = FFA_RET_INVALID_PARAMETERS;
-		ffa_rx_release(res);
-		goto out_unlock;
-	}
-
-	ep_mem_access = (void *)buf + em_mem_access_off;
+	ep_mem_access = (void *)buf +
+			ffa_mem_desc_offset(buf, 0, hyp_ffa_version);
 	offset = ep_mem_access->composite_off;
 	/*
 	 * We can trust the SPMD to get this right, but let's at least
 	 * check that we end up with something that doesn't look _completely_
 	 * bogus.
 	 */
-	if (offset + CONSTITUENTS_OFFSET(0) > len ||
-	    fraglen > KVM_FFA_MBOX_NR_PAGES * PAGE_SIZE) {
+	if (WARN_ON(offset > len ||
+		    fraglen > KVM_FFA_MBOX_NR_PAGES * PAGE_SIZE)) {
 		ret = FFA_RET_ABORTED;
 		ffa_rx_release(res);
 		goto out_unlock;
@@ -1269,16 +1165,10 @@ out_reclaim:
 		ffa_guest_unshare_ranges(hyp_vcpu, transfer);
 	else {
 		reg = (void *)buf + offset;
-		if (pkvm_ffa_unmap_on_lend())
-			ffa_host_clear_handle(handle);
-
-		if (offset + CONSTITUENTS_OFFSET(reg->addr_range_cnt) > len) {
-			ret = FFA_RET_ABORTED;
-			goto out_unlock;
-		}
-
 		WARN_ON(ffa_host_unshare_ranges(reg->constituents,
 						reg->addr_range_cnt, is_lend));
+		if (static_branch_unlikely(&kvm_ffa_unmap_on_lend))
+			ffa_host_clear_handle(handle);
 	}
 
 	if (transfer) {
@@ -1316,28 +1206,13 @@ static bool ffa_call_supported(u64 func_id)
 	case FFA_RXTX_MAP:
 	case FFA_MEM_DONATE:
 	case FFA_MEM_RETRIEVE_REQ:
-       /* Optional notification interfaces added in FF-A 1.1 */
-	case FFA_NOTIFICATION_BITMAP_CREATE:
-	case FFA_NOTIFICATION_BITMAP_DESTROY:
-	case FFA_NOTIFICATION_BIND:
-	case FFA_NOTIFICATION_UNBIND:
-	case FFA_NOTIFICATION_SET:
-	case FFA_NOTIFICATION_GET:
-	case FFA_NOTIFICATION_INFO_GET:
-		return false;
-	/* Optional interfaces added in FF-A 1.2 */
-	case FFA_MSG_SEND_DIRECT_REQ2:		/* Optional per 7.5.1 */
-		return hyp_ffa_version >= FFA_VERSION_1_2;
-	case FFA_MSG_SEND_DIRECT_RESP2:		/* Optional per 7.5.1 */
-	case FFA_CONSOLE_LOG:			/* Optional per 13.1: not in Table 13.1 */
-	case FFA_PARTITION_INFO_GET_REGS:	/* Optional for virtual instances per 13.1 */
 		return false;
 	}
 
 	return true;
 }
 
-static bool do_ffa_features(struct arm_smccc_1_2_regs *res,
+static bool do_ffa_features(struct arm_smccc_res *res,
 			    struct kvm_cpu_context *ctxt)
 {
 	DECLARE_REG(u32, id, ctxt, 1);
@@ -1366,8 +1241,7 @@ out_handled:
 	return true;
 }
 
-static void do_ffa_guest_features(struct arm_smccc_1_2_regs *res,
-				  struct kvm_cpu_context *ctxt)
+static void do_ffa_guest_features(struct arm_smccc_res *res, struct kvm_cpu_context *ctxt)
 {
 	DECLARE_REG(u32, id, ctxt, 1);
 	u64 prop = 0;
@@ -1402,21 +1276,16 @@ out_handled:
 	ffa_to_smccc_res_prop(res, ret, prop);
 }
 
-static void do_ffa_part_get_response(struct arm_smccc_1_2_regs *res,
+static void do_ffa_part_get_response(struct arm_smccc_res *res,
 				     u32 uuid0, u32 uuid1, u32 uuid2,
 				     u32 uuid3, u32 flags, struct kvm_ffa_buffers *ffa_buf)
 {
 	int ret;
 	u32 count, partition_sz, copy_sz;
 
-	nvhe_arm_smccc_1_2_smc(&(struct arm_smccc_1_2_regs) {
-		.a0 = FFA_PARTITION_INFO_GET,
-		.a1 = uuid0,
-		.a2 = uuid1,
-		.a3 = uuid2,
-		.a4 = uuid3,
-		.a5 = flags,
-	}, res);
+	arm_smccc_1_1_smc(FFA_PARTITION_INFO_GET, uuid0, uuid1,
+			  uuid2, uuid3, flags, 0, 0,
+			  res);
 
 	if (res->a0 != FFA_SUCCESS)
 		return;
@@ -1452,25 +1321,21 @@ static void do_ffa_part_get_response(struct arm_smccc_1_2_regs *res,
 static int hyp_ffa_post_init(void)
 {
 	size_t min_rxtx_sz;
-	struct arm_smccc_1_2_regs res;
+	struct arm_smccc_res res;
 
-	nvhe_arm_smccc_1_2_smc(&(struct arm_smccc_1_2_regs){
-		.a0 = FFA_ID_GET,
-	}, &res);
+	arm_smccc_1_1_smc(FFA_ID_GET, 0, 0, 0, 0, 0, 0, 0, &res);
 	if (res.a0 != FFA_SUCCESS)
 		return -EOPNOTSUPP;
 
 	if (res.a2 != HOST_FFA_ID)
 		return -EINVAL;
 
-	nvhe_arm_smccc_1_2_smc(&(struct arm_smccc_1_2_regs){
-		.a0 = FFA_FEATURES,
-		.a1 = FFA_FN64_RXTX_MAP,
-	}, &res);
+	arm_smccc_1_1_smc(FFA_FEATURES, FFA_FN64_RXTX_MAP,
+			  0, 0, 0, 0, 0, 0, &res);
 	if (res.a0 != FFA_SUCCESS)
 		return -EOPNOTSUPP;
 
-	switch (res.a2 & FFA_FEAT_RXTX_MIN_SZ_MASK) {
+	switch (res.a2) {
 	case FFA_FEAT_RXTX_MIN_SZ_4K:
 		min_rxtx_sz = SZ_4K;
 		break;
@@ -1490,7 +1355,7 @@ static int hyp_ffa_post_init(void)
 	return 0;
 }
 
-static void do_ffa_version(struct arm_smccc_1_2_regs *res,
+static void do_ffa_version(struct arm_smccc_res *res,
 			   struct kvm_cpu_context *ctxt)
 {
 	DECLARE_REG(u32, ffa_req_version, ctxt, 1);
@@ -1514,10 +1379,9 @@ static void do_ffa_version(struct arm_smccc_1_2_regs *res,
 	 * first if TEE supports it.
 	 */
 	if (FFA_MINOR_VERSION(ffa_req_version) < FFA_MINOR_VERSION(hyp_ffa_version)) {
-		nvhe_arm_smccc_1_2_smc(&(struct arm_smccc_1_2_regs) {
-			.a0 = FFA_VERSION,
-			.a1 = ffa_req_version,
-		}, res);
+		arm_smccc_1_1_smc(FFA_VERSION, ffa_req_version, 0,
+				  0, 0, 0, 0, 0,
+				  res);
 		if (res->a0 == FFA_RET_NOT_SUPPORTED)
 			goto unlock;
 
@@ -1538,8 +1402,7 @@ unlock:
 	hyp_spin_unlock(&version_lock);
 }
 
-static void do_ffa_guest_version(struct arm_smccc_1_2_regs *res,
-				 struct kvm_cpu_context *ctxt,
+static void do_ffa_guest_version(struct arm_smccc_res *res, struct kvm_cpu_context *ctxt,
 				 struct pkvm_hyp_vcpu *hyp_vcpu)
 {
 	DECLARE_REG(u32, ffa_req_version, ctxt, 1);
@@ -1550,19 +1413,14 @@ static void do_ffa_guest_version(struct arm_smccc_1_2_regs *res,
 	}
 
 	hyp_spin_lock(&version_lock);
-
-	/* No backwards compatibility for you, please update your guest drivers*/
-	if (FFA_MINOR_VERSION(ffa_req_version) < FFA_MINOR_VERSION(hyp_ffa_version)) {
+	if (has_version_negotiated)
+		res->a0 = hyp_ffa_version;
+	else
 		res->a0 = FFA_RET_NOT_SUPPORTED;
-		goto unlock;
-	}
-
-	res->a0 = hyp_ffa_version;
-unlock:
 	hyp_spin_unlock(&version_lock);
 }
 
-static void do_ffa_part_get(struct arm_smccc_1_2_regs *res,
+static void do_ffa_part_get(struct arm_smccc_res *res,
 			    struct kvm_cpu_context *ctxt,
 			    struct pkvm_hyp_vcpu *hyp_vcpu)
 {
@@ -1585,26 +1443,30 @@ out_unlock:
 	hyp_spin_unlock(&kvm_ffa_hyp_lock);
 }
 
-static void do_ffa_direct_msg(struct arm_smccc_1_2_regs *res,
-			      struct kvm_cpu_context *ctxt,
+static void do_ffa_direct_msg(struct kvm_cpu_context *ctxt,
 			      u64 vm_handle)
 {
 	DECLARE_REG(u32, endp, ctxt, 1);
 
-	struct arm_smccc_1_2_regs *args = (void *)&ctxt->regs.regs[0];
+	struct arm_smccc_1_2_regs *reg = (void *)&ctxt->regs.regs[0];
 
 	if (FIELD_GET(FFA_SRC_ENDPOINT_MASK, endp) != vm_handle) {
-		ffa_to_smccc_error(res, FFA_RET_INVALID_PARAMETERS);
+		struct arm_smccc_res res;
+
+		ffa_to_smccc_error(&res, FFA_RET_INVALID_PARAMETERS);
+		ffa_set_retval(ctxt, &res);
 		return;
 	}
 
-	nvhe_arm_smccc_1_2_smc(args, res);
+	__hyp_exit();
+	arm_smccc_1_2_smc(reg, reg);
+	__hyp_enter();
 }
 
 static int kvm_host_ffa_signal_availability(void)
 {
 	int ret;
-	struct arm_smccc_1_2_regs res;
+	struct arm_smccc_res res;
 
 	/*
 	 * Map our hypervisor buffers into the SPMD before mapping and
@@ -1625,7 +1487,7 @@ static int kvm_host_ffa_signal_availability(void)
 
 bool kvm_host_ffa_handler(struct kvm_cpu_context *host_ctxt, u32 func_id)
 {
-	struct arm_smccc_1_2_regs res = {0};
+	struct arm_smccc_res res;
 	int ret;
 
 	/*
@@ -1718,20 +1580,15 @@ bool kvm_host_ffa_handler(struct kvm_cpu_context *host_ctxt, u32 func_id)
 	case FFA_ID_GET:
 		ffa_to_smccc_res_prop(&res, FFA_RET_SUCCESS, HOST_FFA_ID);
 		goto out_handled;
-	case FFA_MSG_SEND_DIRECT_REQ2:
-		if (!ffa_call_supported(func_id))
-			goto out_not_supported;
-		fallthrough;
 	case FFA_MSG_SEND_DIRECT_REQ:
 	case FFA_FN64_MSG_SEND_DIRECT_REQ:
-		do_ffa_direct_msg(&res, host_ctxt, HOST_FFA_ID);
-		goto out_handled;
+		do_ffa_direct_msg(host_ctxt, HOST_FFA_ID);
+		return true;
 	}
 
 	if (ffa_call_supported(func_id))
 		return false; /* Pass through */
 
-out_not_supported:
 	ffa_to_smccc_error(&res, FFA_RET_NOT_SUPPORTED);
 out_handled:
 	ffa_set_retval(host_ctxt, &res);
@@ -1742,15 +1599,20 @@ bool kvm_guest_ffa_handler(struct pkvm_hyp_vcpu *hyp_vcpu, u64 *exit_code)
 {
 	struct kvm_vcpu *vcpu = &hyp_vcpu->vcpu;
 	struct kvm_cpu_context *ctxt = &vcpu->arch.ctxt;
-	struct arm_smccc_1_2_regs res = {0};
+	struct arm_smccc_res res;
+	int ret, hyp_alloc_ret;
 	struct kvm_hyp_req *req;
-	int ret;
 
 	DECLARE_REG(u64, func_id, ctxt, 0);
 
-	if (!is_ffa_call(func_id) || !VM_FFA_SUPPORTED(vcpu) ||
-	    !smp_load_acquire(&has_version_negotiated)) {
+	if (!is_ffa_call(func_id)) {
 		smccc_set_retval(vcpu, SMCCC_RET_NOT_SUPPORTED, 0, 0, 0);
+		return true;
+	}
+
+	if (!VM_FFA_SUPPORTED(vcpu)) {
+		ffa_to_smccc_error(&res, FFA_RET_NOT_SUPPORTED);
+		ffa_set_retval(ctxt, &res);
 		return true;
 	}
 
@@ -1793,26 +1655,27 @@ bool kvm_guest_ffa_handler(struct pkvm_hyp_vcpu *hyp_vcpu, u64 *exit_code)
 		ffa_rx_release(&res);
 		hyp_spin_unlock(&kvm_ffa_hyp_lock);
 		goto out_guest;
-	case FFA_MSG_SEND_DIRECT_REQ2:
-		if (!ffa_call_supported(func_id)) {
-			ret = -EOPNOTSUPP;
-			goto out_guest_with_ret;
-		}
-		fallthrough;
 	case FFA_MSG_SEND_DIRECT_REQ:
 	case FFA_FN64_MSG_SEND_DIRECT_REQ:
-		do_ffa_direct_msg(&res, ctxt, hyp_vcpu_to_ffa_handle(hyp_vcpu));
-		goto out_guest;
+		do_ffa_direct_msg(ctxt, hyp_vcpu_to_ffa_handle(hyp_vcpu));
+		return true;
 	default:
 		ret = -EOPNOTSUPP;
 		break;
 	}
 
-	switch (ret) {
-	case -ENOMEM:
-		if (hyp_alloc_errno() != -ENOMEM) {
-			/* Only hyp_alloc() can raise -ENOMEM. Let the HVC fail */
-			ret = hyp_alloc_errno();
+	if (ret == -EFAULT || ret == -ENOMEM) {
+		hyp_alloc_ret = hyp_alloc_errno();
+		if (hyp_alloc_ret == -ENOMEM) {
+			req = pkvm_hyp_req_reserve(hyp_vcpu, KVM_HYP_REQ_TYPE_MEM);
+			if (!req)
+				goto out_guest_with_ret;
+
+			req->mem.dest = REQ_MEM_DEST_HYP_ALLOC;
+			req->mem.nr_pages = hyp_alloc_missing_donations();
+		} else if (hyp_alloc_ret) {
+			/* Nothing the host can do for us, let the HVC fail */
+			ret = hyp_alloc_ret;
 			goto out_guest_with_ret;
 		}
 
@@ -1820,17 +1683,10 @@ bool kvm_guest_ffa_handler(struct pkvm_hyp_vcpu *hyp_vcpu, u64 *exit_code)
 		if (!req)
 			goto out_guest_with_ret;
 
-		req->mem.dest = REQ_MEM_DEST_HYP_ALLOC;
-		req->mem.nr_pages = hyp_alloc_missing_donations();
-		fallthrough;
-	case -EFAULT:
-		fallthrough;
-	case -E2BIG:
-		/*
-		 * EFAULT and E2BIG have already been handled earlier with
-		 * __handle_mem_protect_err(). Go back to the host and replay the last guest
-		 * instruction.
-		 */
+		req->mem.dest = REQ_MEM_DEST_VCPU_MEMCACHE;
+		req->mem.nr_pages = kvm_mmu_cache_min_pages(&hyp_vcpu->vcpu.kvm->arch.mmu);
+
+		/* Go back to the host and replay the last guest instruction */
 		write_sysreg_el2(read_sysreg_el2(SYS_ELR) - 4, SYS_ELR);
 		*exit_code = ARM_EXCEPTION_HYP_REQ;
 		return false;
@@ -1847,7 +1703,7 @@ static void kvm_guest_try_reclaim_transfer(struct ffa_mem_transfer *transfer,
 					   struct pkvm_hyp_vm *vm)
 {
 	struct ffa_translation *translation, *tmp;
-	struct arm_smccc_1_2_regs res;
+	struct arm_smccc_res res;
 
 	ffa_mem_reclaim(&res, HANDLE_LOW(transfer->ffa_handle),
 			HANDLE_HIGH(transfer->ffa_handle), 0);
@@ -1855,7 +1711,7 @@ static void kvm_guest_try_reclaim_transfer(struct ffa_mem_transfer *transfer,
 		return;
 
 	list_for_each_entry_safe(translation, tmp, &transfer->translations, node) {
-		WARN_ON(__pkvm_guest_unshare_ffa_page(vm, translation->ipa));
+		WARN_ON(__pkvm_guest_unshare_ffa_page(vm->vcpus[0], translation->ipa));
 		list_del(&translation->node);
 		hyp_free(translation);
 	}
@@ -1880,11 +1736,11 @@ int kvm_dying_guest_reclaim_ffa_resources(struct pkvm_hyp_vm *vm)
 	if (list_empty(&ffa_buf->xfer_list)) {
 		/* XXX - needs an explicit rxtx unmap call ? */
 		if (ffa_buf->tx) {
-			WARN_ON(__pkvm_guest_unshare_hyp_page(vm, ffa_buf->tx_ipa));
+			WARN_ON(__pkvm_guest_unshare_hyp_page(vm->vcpus[0], ffa_buf->tx_ipa));
 			ffa_buf->tx = NULL;
 		}
 		if (ffa_buf->rx) {
-			WARN_ON(__pkvm_guest_unshare_hyp_page(vm, ffa_buf->rx_ipa));
+			WARN_ON(__pkvm_guest_unshare_hyp_page(vm->vcpus[0], ffa_buf->rx_ipa));
 			ffa_buf->rx = NULL;
 		}
 		goto unlock;
@@ -1926,17 +1782,13 @@ u32 ffa_get_hypervisor_version(void)
 
 int hyp_ffa_init(void *pages)
 {
-	unsigned long num_pages = hyp_ffa_proxy_pages();
-	struct arm_smccc_1_2_regs res;
+	struct arm_smccc_res res;
 	void *tx, *rx;
 
 	if (kvm_host_psci_config.smccc_version < ARM_SMCCC_VERSION_1_1)
 		return 0;
 
-	nvhe_arm_smccc_1_2_smc(&(struct arm_smccc_1_2_regs) {
-		.a0 = FFA_VERSION,
-		.a1 = FFA_VERSION_1_2,
-	}, &res);
+	arm_smccc_1_1_smc(FFA_VERSION, FFA_VERSION_1_1, 0, 0, 0, 0, 0, 0, &res);
 	if (res.a0 == FFA_RET_NOT_SUPPORTED)
 		return 0;
 
@@ -1956,39 +1808,28 @@ int hyp_ffa_init(void *pages)
 	if (FFA_MAJOR_VERSION(res.a0) != 1)
 		return -EOPNOTSUPP;
 
-	if (FFA_MINOR_VERSION(res.a0) < FFA_MINOR_VERSION(FFA_VERSION_1_2))
+	if (FFA_MINOR_VERSION(res.a0) < FFA_MINOR_VERSION(FFA_VERSION_1_1))
 		hyp_ffa_version = res.a0;
 	else
-		hyp_ffa_version = FFA_VERSION_1_2;
+		hyp_ffa_version = FFA_VERSION_1_1;
 
-	if (num_pages < 2 * KVM_FFA_MBOX_NR_PAGES)
-		return -ENOMEM;
-
-	num_pages -= 2 * KVM_FFA_MBOX_NR_PAGES;
 	tx = pages;
 	pages += KVM_FFA_MBOX_NR_PAGES * PAGE_SIZE;
 	rx = pages;
 	pages += KVM_FFA_MBOX_NR_PAGES * PAGE_SIZE;
 
-	if (pkvm_ffa_unmap_on_lend()) {
-		BUILD_BUG_ON(sizeof(struct ffa_handle) != KVM_FFA_SPM_HANDLE_SIZE);
-
-		if (num_pages < kvm_ffa_spm_nr_pages)
-			return -ENOMEM;
-
-		num_pages -= kvm_ffa_spm_nr_pages;
+	if (static_branch_unlikely(&kvm_ffa_unmap_on_lend)) {
 		spm_handles = pages;
-		pages += kvm_ffa_spm_nr_pages * PAGE_SIZE;
-		num_spm_handles = kvm_ffa_spm_nr_pages * PAGE_SIZE / sizeof(struct ffa_handle);
-		memset(spm_handles, -1, kvm_ffa_spm_nr_pages * PAGE_SIZE);
+		pages += KVM_FFA_SPM_HANDLE_NR_PAGES * PAGE_SIZE;
+		num_spm_handles = KVM_FFA_SPM_HANDLE_NR_PAGES * PAGE_SIZE /
+			sizeof(struct ffa_handle);
+		memset(spm_handles, -1, KVM_FFA_SPM_HANDLE_NR_PAGES * PAGE_SIZE);
 	}
-
-	if (!num_pages)
-		return -ENOMEM;
 
 	ffa_desc_buf = (struct kvm_ffa_descriptor_buffer) {
 		.buf	= pages,
-		.len	= PAGE_SIZE * num_pages,
+		.len	= PAGE_SIZE *
+			  (hyp_ffa_proxy_pages() - (2 * KVM_FFA_MBOX_NR_PAGES)),
 	};
 
 	hyp_buffers = (struct kvm_ffa_buffers) {

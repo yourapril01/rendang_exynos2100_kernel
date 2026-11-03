@@ -30,8 +30,6 @@
 #include <asm/system_misc.h>
 
 #include <trace/hooks/traps.h>
-#include <trace/hooks/gic.h>
-#include <trace/hooks/dtask.h>
 
 /*
  * Handle IRQ/context state management when entering from kernel mode.
@@ -112,12 +110,12 @@ static __always_inline void __enter_from_user_mode(void)
 	user_exit_irqoff();
 	trace_hardirqs_off_finish();
 	mte_disable_tco_entry(current);
-	sme_enter_from_user_mode();
 }
 
 static __always_inline void enter_from_user_mode(struct pt_regs *regs)
 {
 	__enter_from_user_mode();
+	sme_enter_from_user_mode();
 }
 
 /*
@@ -135,16 +133,11 @@ static __always_inline void __exit_to_user_mode(void)
 
 static void do_notify_resume(struct pt_regs *regs, unsigned long thread_flags)
 {
-	int thread_lazy_resched_flag = 0;
-
-	trace_android_vh_restore_curr_resched(&thread_flags, &thread_lazy_resched_flag);
 	do {
 		local_irq_enable();
 
-		if (thread_flags & _TIF_NEED_RESCHED || thread_lazy_resched_flag) {
-			thread_lazy_resched_flag = 0;
+		if (thread_flags & _TIF_NEED_RESCHED)
 			schedule();
-		}
 
 		if (thread_flags & _TIF_UPROBE)
 			uprobe_notify_resume(regs);
@@ -166,25 +159,20 @@ static void do_notify_resume(struct pt_regs *regs, unsigned long thread_flags)
 
 		local_irq_disable();
 		thread_flags = read_thread_flags();
-		trace_android_vh_restore_curr_resched(&thread_flags, &thread_lazy_resched_flag);
-	} while (thread_flags & _TIF_WORK_MASK || thread_lazy_resched_flag);
+	} while (thread_flags & _TIF_WORK_MASK);
 }
 
 static __always_inline void exit_to_user_mode_prepare(struct pt_regs *regs)
 {
 	unsigned long flags;
 
-	int thread_lazy_resched_flag = 0;
-
 	local_irq_disable();
 
 	flags = read_thread_flags();
-	trace_android_vh_restore_curr_resched(&flags, &thread_lazy_resched_flag);
-	if (unlikely(flags & _TIF_WORK_MASK) || thread_lazy_resched_flag)
+	if (unlikely(flags & _TIF_WORK_MASK))
 		do_notify_resume(regs, flags);
 
 	local_daif_mask();
-	sme_exit_to_user_mode();
 
 	lockdep_sys_exit();
 }
@@ -193,6 +181,7 @@ static __always_inline void exit_to_user_mode(struct pt_regs *regs)
 {
 	exit_to_user_mode_prepare(regs);
 	mte_check_tfsr_exit();
+	sme_exit_to_user_mode();
 	__exit_to_user_mode();
 }
 
@@ -340,7 +329,7 @@ static void noinstr __panic_unhandled(struct pt_regs *regs, const char *vector,
 
 	console_verbose();
 
-	pr_crit("Unhandled %s exception on CPU%d, ESR 0x%016lx -- %s\n",
+	pr_auto(ASL1, "Unhandled %s exception on CPU%d, ESR 0x%016lx -- %s\n",
 		vector, smp_processor_id(), esr,
 		esr_get_class_string(esr));
 
@@ -458,28 +447,6 @@ static __always_inline void fpsimd_syscall_exit(void)
 	__this_cpu_write(fpsimd_last_state.to_save, FP_STATE_CURRENT);
 }
 
-/*
- * In debug exception context, we explicitly disable preemption despite
- * having interrupts disabled.
- * This serves two purposes: it makes it much less likely that we would
- * accidentally schedule in exception context and it will force a warning
- * if we somehow manage to schedule by accident.
- */
-static void debug_exception_enter(struct pt_regs *regs)
-{
-	preempt_disable();
-
-	/* This code is a bit fragile.  Test it. */
-	RCU_LOCKDEP_WARN(!rcu_is_watching(), "exception_enter didn't work");
-}
-NOKPROBE_SYMBOL(debug_exception_enter);
-
-static void debug_exception_exit(struct pt_regs *regs)
-{
-	preempt_enable_no_resched();
-}
-NOKPROBE_SYMBOL(debug_exception_exit);
-
 UNHANDLED(el1t, 64, sync)
 UNHANDLED(el1t, 64, irq)
 UNHANDLED(el1t, 64, fiq)
@@ -525,51 +492,13 @@ static void noinstr el1_bti(struct pt_regs *regs, unsigned long esr)
 	exit_to_kernel_mode(regs);
 }
 
-static void noinstr el1_breakpt(struct pt_regs *regs, unsigned long esr)
+static void noinstr el1_dbg(struct pt_regs *regs, unsigned long esr)
 {
-	arm64_enter_el1_dbg(regs);
-	debug_exception_enter(regs);
-	do_breakpoint(esr, regs);
-	debug_exception_exit(regs);
-	arm64_exit_el1_dbg(regs);
-}
-
-static void noinstr el1_softstp(struct pt_regs *regs, unsigned long esr)
-{
-	arm64_enter_el1_dbg(regs);
-	if (!cortex_a76_erratum_1463225_debug_handler(regs)) {
-		debug_exception_enter(regs);
-		/*
-		 * After handling a breakpoint, we suspend the breakpoint
-		 * and use single-step to move to the next instruction.
-		 * If we are stepping a suspended breakpoint there's nothing more to do:
-		 * the single-step is complete.
-		 */
-		if (!try_step_suspended_breakpoints(regs))
-			do_el1_softstep(esr, regs);
-		debug_exception_exit(regs);
-	}
-	arm64_exit_el1_dbg(regs);
-}
-
-static void noinstr el1_watchpt(struct pt_regs *regs, unsigned long esr)
-{
-	/* Watchpoints are the only debug exception to write FAR_EL1 */
 	unsigned long far = read_sysreg(far_el1);
 
 	arm64_enter_el1_dbg(regs);
-	debug_exception_enter(regs);
-	do_watchpoint(far, esr, regs);
-	debug_exception_exit(regs);
-	arm64_exit_el1_dbg(regs);
-}
-
-static void noinstr el1_brk64(struct pt_regs *regs, unsigned long esr)
-{
-	arm64_enter_el1_dbg(regs);
-	debug_exception_enter(regs);
-	do_el1_brk64(esr, regs);
-	debug_exception_exit(regs);
+	if (!cortex_a76_erratum_1463225_debug_handler(regs))
+		do_debug_exception(far, esr, regs);
 	arm64_exit_el1_dbg(regs);
 }
 
@@ -606,16 +535,10 @@ asmlinkage void noinstr el1h_64_sync_handler(struct pt_regs *regs)
 		el1_bti(regs, esr);
 		break;
 	case ESR_ELx_EC_BREAKPT_CUR:
-		el1_breakpt(regs, esr);
-		break;
 	case ESR_ELx_EC_SOFTSTP_CUR:
-		el1_softstp(regs, esr);
-		break;
 	case ESR_ELx_EC_WATCHPT_CUR:
-		el1_watchpt(regs, esr);
-		break;
 	case ESR_ELx_EC_BRK64:
-		el1_brk64(regs, esr);
+		el1_dbg(regs, esr);
 		break;
 	case ESR_ELx_EC_FPAC:
 		el1_fpac(regs, esr);
@@ -664,7 +587,6 @@ asmlinkage void noinstr el1h_64_irq_handler(struct pt_regs *regs)
 
 asmlinkage void noinstr el1h_64_fiq_handler(struct pt_regs *regs)
 {
-	trace_android_rvh_fiq_dump(regs);
 	el1_interrupt(regs, handle_arch_fiq);
 }
 
@@ -799,58 +721,14 @@ static void noinstr el0_inv(struct pt_regs *regs, unsigned long esr)
 	exit_to_user_mode(regs);
 }
 
-static void noinstr el0_breakpt(struct pt_regs *regs, unsigned long esr)
+static void noinstr el0_dbg(struct pt_regs *regs, unsigned long esr)
 {
-	if (!is_ttbr0_addr(regs->pc))
-		arm64_apply_bp_hardening();
-
-	enter_from_user_mode(regs);
-	debug_exception_enter(regs);
-	do_breakpoint(esr, regs);
-	debug_exception_exit(regs);
-	local_daif_restore(DAIF_PROCCTX);
-	exit_to_user_mode(regs);
-}
-
-static void noinstr el0_softstp(struct pt_regs *regs, unsigned long esr)
-{
-	bool step_done;
-
-	if (!is_ttbr0_addr(regs->pc))
-		arm64_apply_bp_hardening();
-
-	enter_from_user_mode(regs);
-	/*
-	 * After handling a breakpoint, we suspend the breakpoint
-	 * and use single-step to move to the next instruction.
-	 * If we are stepping a suspended breakpoint there's nothing more to do:
-	 * the single-step is complete.
-	 */
-	step_done = try_step_suspended_breakpoints(regs);
-	local_daif_restore(DAIF_PROCCTX);
-	if (!step_done)
-		do_el0_softstep(esr, regs);
-	exit_to_user_mode(regs);
-}
-
-static void noinstr el0_watchpt(struct pt_regs *regs, unsigned long esr)
-{
-	/* Watchpoints are the only debug exception to write FAR_EL1 */
+	/* Only watchpoints write FAR_EL1, otherwise its UNKNOWN */
 	unsigned long far = read_sysreg(far_el1);
 
 	enter_from_user_mode(regs);
-	debug_exception_enter(regs);
-	do_watchpoint(far, esr, regs);
-	debug_exception_exit(regs);
+	do_debug_exception(far, esr, regs);
 	local_daif_restore(DAIF_PROCCTX);
-	exit_to_user_mode(regs);
-}
-
-static void noinstr el0_brk64(struct pt_regs *regs, unsigned long esr)
-{
-	enter_from_user_mode(regs);
-	local_daif_restore(DAIF_PROCCTX);
-	do_el0_brk64(esr, regs);
 	exit_to_user_mode(regs);
 }
 
@@ -919,16 +797,10 @@ asmlinkage void noinstr el0t_64_sync_handler(struct pt_regs *regs)
 		el0_mops(regs, esr);
 		break;
 	case ESR_ELx_EC_BREAKPT_LOW:
-		el0_breakpt(regs, esr);
-		break;
 	case ESR_ELx_EC_SOFTSTP_LOW:
-		el0_softstp(regs, esr);
-		break;
 	case ESR_ELx_EC_WATCHPT_LOW:
-		el0_watchpt(regs, esr);
-		break;
 	case ESR_ELx_EC_BRK64:
-		el0_brk64(regs, esr);
+		el0_dbg(regs, esr);
 		break;
 	case ESR_ELx_EC_FPAC:
 		el0_fpac(regs, esr);
@@ -972,7 +844,6 @@ static void noinstr __el0_fiq_handler_common(struct pt_regs *regs)
 
 asmlinkage void noinstr el0t_64_fiq_handler(struct pt_regs *regs)
 {
-	trace_android_rvh_fiq_dump(regs);
 	__el0_fiq_handler_common(regs);
 }
 
@@ -1012,14 +883,6 @@ static void noinstr el0_svc_compat(struct pt_regs *regs)
 	exit_to_user_mode(regs);
 }
 
-static void noinstr el0_bkpt32(struct pt_regs *regs, unsigned long esr)
-{
-	enter_from_user_mode(regs);
-	local_daif_restore(DAIF_PROCCTX);
-	do_bkpt32(esr, regs);
-	exit_to_user_mode(regs);
-}
-
 asmlinkage void noinstr el0t_32_sync_handler(struct pt_regs *regs)
 {
 	unsigned long esr = read_sysreg(esr_el1);
@@ -1054,16 +917,10 @@ asmlinkage void noinstr el0t_32_sync_handler(struct pt_regs *regs)
 		el0_cp15(regs, esr);
 		break;
 	case ESR_ELx_EC_BREAKPT_LOW:
-		el0_breakpt(regs, esr);
-		break;
 	case ESR_ELx_EC_SOFTSTP_LOW:
-		el0_softstp(regs, esr);
-		break;
 	case ESR_ELx_EC_WATCHPT_LOW:
-		el0_watchpt(regs, esr);
-		break;
 	case ESR_ELx_EC_BKPT32:
-		el0_bkpt32(regs, esr);
+		el0_dbg(regs, esr);
 		break;
 	default:
 		el0_inv(regs, esr);

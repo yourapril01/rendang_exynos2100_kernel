@@ -11,7 +11,6 @@
 #include <linux/interval_tree_generic.h>
 #include <linux/io.h>
 #include <linux/iommu.h>
-#include <linux/irqchip/arm-gic-v3.h>
 #include <linux/kmemleak.h>
 #include <linux/kvm_host.h>
 #include <asm/kvm_mmu.h>
@@ -164,10 +163,8 @@ static int __init register_moveable_fdt_resource(struct device_node *np,
 
 		start = res.start;
 		size = resource_size(&res);
-		if (!PAGE_ALIGNED(start) || !PAGE_ALIGNED(size)) {
-			kvm_err("Not %lu page aligned node: %s\n", PAGE_SIZE, np->full_name);
+		if (!PAGE_ALIGNED(start) || !PAGE_ALIGNED(size))
 			return -EINVAL;
-		}
 
 		moveable_regs[i].start = start;
 		moveable_regs[i].size = size;
@@ -180,82 +177,11 @@ static int __init register_moveable_fdt_resource(struct device_node *np,
 	return 0;
 }
 
-static int pkvm_register_gic_redist_cb(phys_addr_t phys, u64 size)
-{
-	unsigned int idx = kvm_nvhe_sym(pkvm_moveable_regs_nr);
-
-	if (idx >= PKVM_NR_MOVEABLE_REGS)
-		return -ENOMEM;
-	if (size < SZ_64K)
-		return -EINVAL;
-
-	moveable_regs[idx].start = phys;
-	moveable_regs[idx].size = SZ_64K;
-	moveable_regs[idx].type = PKVM_MREG_EMULATE_MMIO;
-	moveable_regs[idx].cb = lm_alias(&kvm_nvhe_sym(pkvm_handle_rdist_emulation));
-	idx++;
-
-	/* Skip SGI_Base to avoid bottlenecking vgic with emulation */
-
-	if (size >= 3 * SZ_64K) {
-		if (idx >= PKVM_NR_MOVEABLE_REGS)
-			return -ENOMEM;
-
-		moveable_regs[idx].start = phys + SZ_128K;
-		moveable_regs[idx].size = SZ_64K;
-		moveable_regs[idx].type = PKVM_MREG_EMULATE_MMIO;
-		moveable_regs[idx].cb =
-			lm_alias(&kvm_nvhe_sym(pkvm_handle_vlpi_emulation));
-		idx++;
-	}
-
-	kvm_nvhe_sym(pkvm_moveable_regs_nr) = idx;
-	return 0;
-}
-
-static int __init register_its_emulated_region(void)
-{
-	int ret = 0, i = kvm_nvhe_sym(pkvm_moveable_regs_nr);
-	struct device_node *np;
-	struct resource res;
-
-	for_each_compatible_node(np, NULL, "arm,gic-v3-its") {
-		ret = of_address_to_resource(np, 0, &res);
-		if (ret)
-			return ret;
-
-		if (i >= PKVM_NR_MOVEABLE_REGS) {
-			ret = -ENOMEM;
-			goto out_fail;
-		}
-
-		if (!PAGE_ALIGNED(res.start) || !PAGE_ALIGNED(resource_size(&res))) {
-			ret = -EINVAL;
-			goto out_fail;
-		}
-
-		moveable_regs[i].start = res.start;
-		moveable_regs[i].type = PKVM_MREG_EMULATE_MMIO;
-		moveable_regs[i].cb = lm_alias(&kvm_nvhe_sym(pkvm_handle_gic_emulation));
-		moveable_regs[i].size = min_t(u64, resource_size(&res),
-					      PAGE_ALIGN_DOWN(GITS_TRANSLATER));
-		i++;
-	}
-	kvm_nvhe_sym(pkvm_moveable_regs_nr) = i;
-	return i;
-out_fail:
-	of_node_put(np);
-	kvm_nvhe_sym(pkvm_moveable_regs_nr) = 0;
-	return ret;
-}
-
-DEFINE_STATIC_KEY_FALSE(kvm_its_hardening);
-
 static int __init register_moveable_regions(void)
 {
 	struct memblock_region *reg;
 	struct device_node *np;
-	int i = 0, ret = 0, idx;
+	int i = 0, ret = 0, idx = 0;
 
 	for_each_mem_region(reg) {
 		if (i >= PKVM_NR_MOVEABLE_REGS)
@@ -267,20 +193,6 @@ static int __init register_moveable_regions(void)
 	}
 	kvm_nvhe_sym(pkvm_moveable_regs_nr) = i;
 
-	if (static_branch_unlikely(&kvm_its_hardening)) {
-		ret = register_its_emulated_region();
-		if (ret < 0)
-			return ret;
-
-		ret = gic_pkvm_iter_early_redists(pkvm_register_gic_redist_cb);
-		if (ret < 0) {
-			kvm_err("Failed to register GIC redistributors for emulation: %d\n",
-				ret);
-			kvm_nvhe_sym(pkvm_moveable_regs_nr) = 0;
-			return ret;
-		}
-	}
-
 	for_each_compatible_node(np, NULL, "pkvm,protected-region") {
 		ret = register_moveable_fdt_resource(np, PKVM_MREG_PROTECTED_RANGE);
 		if (ret)
@@ -290,7 +202,6 @@ static int __init register_moveable_regions(void)
 	for_each_compatible_node(np, NULL, PKVM_DEVICE_ASSIGN_COMPAT) {
 		struct of_phandle_args args;
 
-		idx = 0;
 		while (!of_parse_phandle_with_fixed_args(np, "devices", 1, idx, &args)) {
 			idx++;
 			ret = register_moveable_fdt_resource(args.np, PKVM_MREG_ASSIGN_MMIO);
@@ -315,12 +226,7 @@ static int __init early_hyp_lm_size_mb_cfg(char *arg)
 }
 early_param("kvm-arm.hyp_lm_size_mb", early_hyp_lm_size_mb_cfg);
 
-static int __init early_ffa_max_nr_constituents(char *arg)
-{
-	return kstrtoul(arg, 10, &kvm_nvhe_sym(ffa_max_nr_constituents));
-}
-
-early_param("kvm-arm.ffa_max_nr_constituents", early_ffa_max_nr_constituents);
+DEFINE_STATIC_KEY_FALSE(kvm_ffa_unmap_on_lend);
 
 void __init kvm_hyp_reserve(void)
 {
@@ -353,6 +259,9 @@ void __init kvm_hyp_reserve(void)
 	hyp_mem_pages += hyp_vmemmap_pages(STRUCT_HYP_PAGE_SIZE);
 	hyp_mem_pages += pkvm_selftest_pages();
 	hyp_mem_pages += hyp_ffa_proxy_pages();
+
+	if (static_branch_unlikely(&kvm_ffa_unmap_on_lend))
+		hyp_mem_pages += KVM_FFA_SPM_HANDLE_NR_PAGES;
 
 	hyp_mem_pages++; /* hyp_ppages */
 
@@ -417,6 +326,79 @@ err_free_reqs:
 	return ret;
 }
 
+/*
+ * Handle broken down huge pages which have not been reported to the
+ * kvm_pinned_page.
+ */
+int pkvm_call_hyp_nvhe_ppage(struct kvm_pinned_page *ppage,
+			     int (*call_hyp_nvhe)(u64 pfn, u64 gfn, u8 order, void* args),
+			     void *args, bool unmap)
+{
+	size_t page_size, size = PAGE_SIZE << ppage->order;
+	u64 pfn = page_to_pfn(ppage->page);
+	u8 order = ppage->order;
+	u64 gfn = ppage->ipa >> PAGE_SHIFT;
+
+	/* We already know this huge-page has been broken down in the stage-2 */
+	if (ppage->pins < (1 << order))
+		order = 0;
+
+	while (size) {
+		int err = call_hyp_nvhe(pfn, gfn, order, args);
+
+		switch (err) {
+		/* The stage-2 huge page has been broken down */
+		case -E2BIG:
+			if (order)
+				order = 0;
+			else
+				/* Something is really wrong ... */
+				return -EINVAL;
+			break;
+		/* This has been unmapped already */
+		case -ENOENT:
+			/*
+			 * We are not supposed to lose track of PAGE_SIZE pinned
+			 * page.
+			 */
+			if (!ppage->order)
+				return -EINVAL;
+
+			fallthrough;
+		case 0:
+			page_size = PAGE_SIZE << order;
+			gfn += 1 << order;
+			pfn += 1 << order;
+
+			if (page_size > size)
+				return -EINVAL;
+
+			/* If -ENOENT, the pin was already dropped. */
+			if (unmap && !err)
+				ppage->pins -= 1 << order;
+
+			if (!ppage->pins)
+				return 0;
+
+			size -= page_size;
+			break;
+		default:
+			return err;
+		}
+	}
+
+	return 0;
+}
+
+static int __reclaim_dying_guest_page_call(u64 pfn, u64 gfn, u8 order, void *args)
+{
+	struct kvm *host_kvm = args;
+
+	return kvm_call_hyp_nvhe(__pkvm_reclaim_dying_guest_page,
+				 host_kvm->arch.pkvm.handle,
+				 pfn, gfn, order);
+}
+
 /* __pkvm_notify_guest_vm_avail_retry - notify secure of the VM state change
  * @host_kvm: the kvm structure
  * @availability_msg: the VM state that will be notified
@@ -465,7 +447,7 @@ static int __pkvm_notify_guest_vm_avail_retry(struct kvm *host_kvm, u32 availabi
 
 static void __pkvm_destroy_hyp_vm(struct kvm *host_kvm)
 {
-	struct mm_struct *mm = host_kvm->mm;
+	struct mm_struct *mm = current->mm;
 	struct kvm_pinned_page *ppage;
 	struct kvm_vcpu *host_vcpu;
 	unsigned long nr_busy;
@@ -484,10 +466,11 @@ retry:
 	ppage = kvm_pinned_pages_iter_first(&host_kvm->arch.pkvm.pinned_pages, 0, ~(0UL));
 	while (ppage) {
 		struct kvm_pinned_page *next;
+		u16 pins = ppage->pins;
 
-		ret = kvm_call_hyp_nvhe(__pkvm_reclaim_dying_guest_page, host_kvm->arch.pkvm.handle,
-					ppage->pfn, ppage->ipa >> PAGE_SHIFT,
-					ppage->order);
+		ret = pkvm_call_hyp_nvhe_ppage(ppage,
+						 __reclaim_dying_guest_page_call,
+						 host_kvm, true);
 		cond_resched();
 		if (ret == -EBUSY) {
 			nr_busy++;
@@ -497,11 +480,10 @@ retry:
 		}
 		WARN_ON(ret);
 
-		pkvm_release_ppage(ppage, true);
+		unpin_user_pages_dirty_lock(&ppage->page, 1, true);
 		next = kvm_pinned_pages_iter_next(ppage, 0, ~(0UL));
 		kvm_pinned_pages_remove(ppage, &host_kvm->arch.pkvm.pinned_pages);
-		ppage->slot->arch.pkvm_pf_count--;
-		pages += 1 << ppage->order;
+		pages += pins;
 		kfree(ppage);
 		ppage = next;
 	}
@@ -678,28 +660,21 @@ static int pkvm_register_device(struct of_phandle_args *args,
 	while (!of_parse_phandle_with_args(np, "iommus",
 					   "#iommu-cells",
 					   j, &iommu_spec)) {
-		u64 endpoint;
+		if (iommu_spec.args_count != 1) {
+			kvm_err("[Devices] Unsupported binding for %s, expected <&iommu id>",
+				np->full_name);
+			return -EINVAL;
+		}
 
 		if (j >= PKVM_DEVICE_MAX_RESOURCE) {
 			of_node_put(iommu_spec.np);
 			return -E2BIG;
 		}
 
-		if (iommu_spec.args_count != 1) {
-			/* Unknown binding, check if the driver knows it. */
-			if (kvm_get_iommu_endpoint(&iommu_spec, &endpoint)) {
-				kvm_err("[Devices] Unsupported binding for %s, expected <&iommu id>",
-					np->full_name);
-				return -EINVAL;
-			}
-		} else {
-			endpoint = iommu_spec.args[0];
-		}
-
 		iommu_id = kvm_get_iommu_id_by_of(iommu_spec.np);
 
 		dev->iommus[j].id = iommu_id;
-		dev->iommus[j].endpoint = endpoint;
+		dev->iommus[j].endpoint = iommu_spec.args[0];
 		of_node_put(iommu_spec.np);
 		j++;
 	}
@@ -733,7 +708,7 @@ static int pkvm_init_devices(void)
 
 	dev_sz = PAGE_ALIGN(size_mul(sizeof(struct pkvm_device), dev_cnt));
 
-	dev_base = alloc_pages_exact(dev_sz, GFP_KERNEL_ACCOUNT | __GFP_ZERO);
+	dev_base = alloc_pages_exact(dev_sz, GFP_KERNEL_ACCOUNT);
 
 	if (!dev_base)
 		return -ENOMEM;
@@ -769,63 +744,16 @@ static void __init _kvm_host_prot_finalize(void *arg)
 		WRITE_ONCE(*err, -EINVAL);
 }
 
-#define ITS_PRIV_NUM_PAGES	(2UL)
-
-static int pkvm_init_its_emulation(phys_addr_t dev_addr, struct its_shadow_tables *shadow)
-{
-	size_t its_priv_sz = ITS_PRIV_NUM_PAGES << PAGE_SHIFT;
-	void *its_state;
-	int ret;
-
-	its_state = alloc_pages_exact(its_priv_sz, GFP_ATOMIC);
-	if (!its_state)
-		return -ENOMEM;
-
-	ret = kvm_call_hyp_nvhe(__pkvm_init_its_emulation, dev_addr, its_state, ITS_PRIV_NUM_PAGES,
-				shadow);
-	if (ret)
-		free_pages_exact(its_state, its_priv_sz);
-
-	return ret;
-}
-
-static int pkvm_init_redist_emulation(phys_addr_t dev_addr)
-{
-	void *redist_state;
-	int ret;
-
-	redist_state = (void *)__get_free_page(GFP_ATOMIC);
-	if (!redist_state)
-		return -ENOMEM;
-
-	ret = kvm_call_hyp_nvhe(__pkvm_init_redist_emulation, dev_addr,
-				redist_state);
-	if (ret)
-		free_page((unsigned long)redist_state);
-
-	return ret;
-}
-
 static int __init pkvm_drop_host_privileges(void)
 {
 	int ret = 0;
-	unsigned long its_flags;
 
 	/*
 	 * Flip the static key upfront as that may no longer be possible
 	 * once the host stage 2 is installed.
 	 */
 	static_branch_enable(&kvm_protected_mode_initialized);
-
-	if (static_branch_unlikely(&kvm_its_hardening))
-		its_start_deprivilege(&its_flags);
-
 	on_each_cpu(_kvm_host_prot_finalize, &ret, 1);
-
-	if (static_branch_unlikely(&kvm_its_hardening)) {
-		its_end_deprivilege(ret, &its_flags, &pkvm_init_its_emulation);
-		gic_redist_deprivilege(&pkvm_init_redist_emulation);
-	}
 	return ret;
 }
 
@@ -886,27 +814,31 @@ device_initcall_sync(finalize_pkvm);
 
 void pkvm_host_reclaim_page(struct kvm *host_kvm, phys_addr_t ipa)
 {
-	struct mm_struct *mm = host_kvm->mm;
+	struct mm_struct *mm = current->mm;
 	struct kvm_pinned_page *ppage;
-	u8 order;
+	u16 pins;
 
 	write_lock(&host_kvm->mmu_lock);
 	ppage = kvm_pinned_pages_iter_first(&host_kvm->arch.pkvm.pinned_pages,
 					   ipa, ipa + PAGE_SIZE - 1);
 	if (ppage) {
-		order = ppage->order;
-		if (!order) {
-			kvm_pinned_pages_remove(ppage, &host_kvm->arch.pkvm.pinned_pages);
-			ppage->slot->arch.pkvm_pf_count--;
-		}
+		WARN_ON_ONCE(ppage->pins != 1);
+
+		if (ppage->pins)
+			ppage->pins--;
+
+		pins = ppage->pins;
+		if (!pins)
+			kvm_pinned_pages_remove(ppage,
+						&host_kvm->arch.pkvm.pinned_pages);
 	}
 	write_unlock(&host_kvm->mmu_lock);
 
-	if (WARN_ON(!ppage || order))
+	if (WARN_ON(!ppage) || pins)
 		return;
 
 	account_locked_vm(mm, 1 << ppage->order, false);
-	pkvm_release_ppage(ppage, true);
+	unpin_user_pages_dirty_lock(&ppage->page, 1, true);
 	kfree(ppage);
 }
 
@@ -1270,6 +1202,27 @@ static struct module *pkvm_el2_mod_to_module(struct pkvm_el2_module *hyp_mod)
 	return container_of(arch, struct module, arch);
 }
 
+#ifdef CONFIG_PKVM_STACKTRACE
+unsigned long pkvm_el2_mod_kern_va(unsigned long addr)
+{
+	struct pkvm_el2_module *mod;
+
+	list_for_each_entry(mod, &pkvm_modules, node) {
+		unsigned long hyp_va = (unsigned long)mod->hyp_va;
+		size_t len = (unsigned long)mod->sections.end -
+			     (unsigned long)mod->sections.start;
+
+		if (addr >= hyp_va && addr < (hyp_va + len))
+			return (unsigned long)mod->sections.start +
+				(addr - hyp_va);
+	}
+
+	return 0;
+}
+#else
+unsigned long pkvm_el2_mod_kern_va(unsigned long addr) { return 0; }
+#endif
+
 static struct pkvm_el2_module *pkvm_el2_mod_lookup_symbol(const char *name,
 							  unsigned long *addr)
 {
@@ -1293,69 +1246,74 @@ static struct pkvm_el2_module *pkvm_el2_mod_lookup_symbol(const char *name,
 static bool within_pkvm_module_section(struct pkvm_module_section *section,
 				       unsigned long addr)
 {
-	return (addr >= (unsigned long)section->start) &&
+	return (addr > (unsigned long)section->start) &&
 		(addr < (unsigned long)section->end);
 }
 
 static int pkvm_reloc_imported_symbol(struct pkvm_el2_module *importer,
-				      struct pkvm_el2_module *exporter,
 				      struct pkvm_el2_sym *sym,
-				      unsigned long sym_addr)
+				      unsigned long hyp_dst)
 {
+	s64 val, val_max = (s64)(~(BIT(25) - 1)) << 2;
 	u32 insn = le32_to_cpu(*sym->rela_pos);
-	unsigned long hyp_orig, hyp_dst;
-	s64 offset;
+	unsigned long hyp_src;
+	u64 imm;
 
 	if (!within_pkvm_module_section(&importer->text,
-					(unsigned long)sym->rela_pos)) {
-		pr_warn("pKVM symbol %s not part of %s .text section\n",
-			sym->name,
-			pkvm_el2_mod_to_module(importer)->name);
+					(unsigned long)sym->rela_pos))
 		return -EINVAL;
-	}
 
-	if (!within_pkvm_module_section(&exporter->text, sym_addr)) {
-		pr_warn("pKVM symbol %s not part of %s .text section\n",
-			sym->name,
-			pkvm_el2_mod_to_module(exporter)->name);
+	hyp_src = (unsigned long)importer->hyp_va +
+		((void *)sym->rela_pos - importer->text.start);
+
+	/*
+	 * Module hyp VAs are allocated going upward. Source MUST have a
+	 * lower address than the destination
+	 */
+	if (WARN_ON(hyp_src < hyp_dst))
 		return -EINVAL;
-	}
 
-	hyp_dst = __pkvm_el2_mod_va(exporter, (void *)sym_addr);
-	hyp_orig = __pkvm_el2_mod_va(importer, (void *)sym->rela_pos);
-	offset = (s64)hyp_dst - (s64)hyp_orig;
-
-	/* imm26 is 2's complement and equals to offset / 4 */
-	offset >>= 2;
-	if (offset < -(s64)BIT(25) || offset >= (s64)BIT(25)) {
-		pr_warn("pKVM symbol %s@0x%lx is too far to branch from 0x%lx [%s]\n",
-			sym->name, hyp_dst, hyp_orig, pkvm_el2_mod_to_module(importer)->name);
+	val = hyp_dst - hyp_src;
+	if (val < val_max) {
+		pr_warn("Exported symbol %s is too far for the relocation in module %s\n",
+			sym->name, pkvm_el2_mod_to_module(importer)->name);
 		return -ERANGE;
 	}
 
-	insn = aarch64_insn_encode_immediate(AARCH64_INSN_IMM_26, insn, offset);
+	/* offset encoded as imm26 * 4 */
+	imm = (val >> 2) & (BIT(26) - 1);
+
+	insn = aarch64_insn_encode_immediate(AARCH64_INSN_IMM_26, insn, imm);
 
 	return aarch64_insn_patch_text_nosync((void *)sym->rela_pos, insn);
 }
 
 static int pkvm_reloc_imported_symbols(struct pkvm_el2_module *importer)
 {
+	unsigned long addr, offset, hyp_addr;
+	struct pkvm_el2_module *exporter;
 	struct pkvm_el2_sym *sym;
 
 	list_for_each_entry(sym, &importer->ext_symbols, node) {
-		struct pkvm_el2_module *exporter;
-		unsigned long addr;
-		int ret;
-
 		exporter = pkvm_el2_mod_lookup_symbol(sym->name, &addr);
 		if (!exporter) {
-			pr_warn("pKVM symbol %s not exported by any module\n", sym->name);
+			pr_warn("pKVM symbol %s not exported by any module\n",
+				sym->name);
 			return -EINVAL;
 		}
 
-		ret = pkvm_reloc_imported_symbol(importer, exporter, sym, addr);
-		if (ret)
-			return ret;
+		if (!within_pkvm_module_section(&exporter->text, addr)) {
+			pr_warn("pKVM symbol %s not part of %s .text section\n",
+				sym->name,
+				pkvm_el2_mod_to_module(exporter)->name);
+			return -EINVAL;
+		}
+
+		/* hyp addr in the exporter */
+		offset = addr - (unsigned long)exporter->text.start;
+		hyp_addr = (unsigned long)exporter->hyp_va + offset;
+
+		pkvm_reloc_imported_symbol(importer, sym, hyp_addr);
 	}
 
 	return 0;
@@ -1495,77 +1453,6 @@ static void pkvm_module_kmemleak(struct module *this,
 	kmemleak_scan_area(start, end - start, GFP_KERNEL);
 }
 
-#define PKVM_EL2_MOD_DIRECT_RANGE	SZ_128M
-
-static unsigned long mod_direct_kern_base;
-static unsigned long mod_direct_hyp_base;
-
-unsigned long pkvm_el2_mod_kern_va(unsigned long addr)
-{
-	struct pkvm_el2_module *mod;
-
-	/* Fast lookup into the direct range */
-	if (mod_direct_hyp_base &&
-	    addr >= mod_direct_hyp_base &&
-	    addr < mod_direct_hyp_base + PKVM_EL2_MOD_DIRECT_RANGE)
-		return mod_direct_kern_base + (addr - mod_direct_hyp_base);
-
-	list_for_each_entry(mod, &pkvm_modules, node) {
-		unsigned long hyp_va = (unsigned long)mod->hyp_va;
-		size_t len = (unsigned long)mod->sections.end -
-			     (unsigned long)mod->sections.start;
-
-		if (addr >= hyp_va && addr < (hyp_va + len))
-			return (unsigned long)mod->sections.start +
-				(addr - hyp_va);
-	}
-
-	return 0;
-}
-
-static void *pkvm_el2_mod_alloc_hyp_va(size_t size)
-{
-	struct arm_smccc_res res;
-
-	arm_smccc_1_1_hvc(KVM_HOST_SMCCC_FUNC(__pkvm_alloc_module_va), size >> PAGE_SHIFT, &res);
-	if (res.a0 != SMCCC_RET_SUCCESS || !res.a1)
-		return NULL;
-
-	return (void *)res.a1;
-}
-
-static __ref void *pkvm_el2_mod_alloc_mod_direct(unsigned long start, unsigned long end)
-{
-	if (mod_direct_hyp_base)
-		goto alloc;
-
-	mod_direct_kern_base = module_direct_base ?: module_plt_base;
-	if (WARN_ON(!mod_direct_kern_base))
-		return NULL;
-
-	mod_direct_hyp_base = (unsigned long)pkvm_el2_mod_alloc_hyp_va(PKVM_EL2_MOD_DIRECT_RANGE);
-	if (!mod_direct_hyp_base) {
-		mod_direct_kern_base = 0;
-		return NULL;
-	}
-
-alloc:
-	if (start < mod_direct_kern_base ||
-	    end > mod_direct_kern_base + PKVM_EL2_MOD_DIRECT_RANGE)
-		return NULL;
-
-	return (void *)(mod_direct_hyp_base + (start - mod_direct_kern_base));
-}
-
-static void *pkvm_el2_mod_alloc_va(unsigned long start, unsigned long end)
-{
-	void *hyp_va;
-
-	hyp_va = pkvm_el2_mod_alloc_mod_direct(start, end);
-
-	return hyp_va ?: pkvm_el2_mod_alloc_hyp_va(end - start);
-}
-
 int __pkvm_load_el2_module(struct module *this, unsigned long *token)
 {
 	struct pkvm_el2_module *mod = &this->arch.hyp;
@@ -1578,6 +1465,7 @@ int __pkvm_load_el2_module(struct module *this, unsigned long *token)
 		{ &mod->data, KVM_PGTABLE_PROT_R | KVM_PGTABLE_PROT_W },
 	};
 	void *start, *end, *hyp_va, *mod_remap;
+	struct arm_smccc_res res;
 	kvm_nvhe_reloc_t *endrel;
 	int ret, i, secs_first;
 	size_t size;
@@ -1611,12 +1499,14 @@ int __pkvm_load_el2_module(struct module *this, unsigned long *token)
 	mod->sections.start = start;
 	mod->sections.end = end;
 
-	hyp_va = pkvm_el2_mod_alloc_va((unsigned long)start, (unsigned long)end);
-	if (!hyp_va) {
+	arm_smccc_1_1_hvc(KVM_HOST_SMCCC_FUNC(__pkvm_alloc_module_va),
+			  size >> PAGE_SHIFT, &res);
+	if (res.a0 != SMCCC_RET_SUCCESS || !res.a1) {
 		kvm_err("Failed to allocate hypervisor VA space for EL2 module\n");
 		module_put(this);
-		return -ENOMEM;
+		return res.a0 == SMCCC_RET_SUCCESS ? -ENOMEM : -EPERM;
 	}
+	hyp_va = (void *)res.a1;
 	mod->hyp_va = hyp_va;
 
 	/*
@@ -1627,13 +1517,15 @@ int __pkvm_load_el2_module(struct module *this, unsigned long *token)
 	if (token)
 		*token = (unsigned long)hyp_va;
 
-	/* Relies on kvm_apply_hyp_module_relocations() sync_icache_aliases */
-	ret = pkvm_reloc_imported_symbols(mod);
-	if (ret)
-		return ret;
+	mod->sections.start = start;
+	mod->sections.end = end;
 
 	endrel = (void *)mod->relocs + mod->nr_relocs * sizeof(*endrel);
 	kvm_apply_hyp_module_relocations(mod, mod->relocs, endrel);
+
+	ret = pkvm_reloc_imported_symbols(mod);
+	if (ret)
+		return ret;
 
 	pkvm_module_kmemleak(this, secs_map, ARRAY_SIZE(secs_map));
 
@@ -1663,8 +1555,7 @@ int __pkvm_load_el2_module(struct module *this, unsigned long *token)
 	if (ret) {
 		kvm_err("Failed to init EL2 module: %d\n", ret);
 		list_del(&mod->node);
-		pkvm_unmap_module_sections(secs_map + secs_first, hyp_va,
-					   ARRAY_SIZE(secs_map) - secs_first);
+		pkvm_unmap_module_sections(secs_map, hyp_va, ARRAY_SIZE(secs_map));
 		module_put(this);
 		return ret;
 	}
@@ -1699,18 +1590,6 @@ void pkvm_el2_mod_frob_sections(Elf_Ehdr *ehdr, Elf_Shdr *sechdrs, char *secstri
 }
 #endif /* CONFIG_MODULES */
 
-int __pkvm_topup_hyp_alloc_mgt_mc(unsigned long id, struct kvm_hyp_memcache *mc)
-{
-	struct arm_smccc_res res;
-
-	res = kvm_call_hyp_nvhe_smccc(__pkvm_hyp_alloc_mgt_refill,
-				      id, mc->head, mc->nr_pages);
-	mc->head = res.a2;
-	mc->nr_pages = res.a3;
-	return res.a1;
-}
-EXPORT_SYMBOL(__pkvm_topup_hyp_alloc_mgt_mc);
-
 int __pkvm_topup_hyp_alloc(unsigned long nr_pages)
 {
 	struct kvm_hyp_memcache mc;
@@ -1722,7 +1601,8 @@ int __pkvm_topup_hyp_alloc(unsigned long nr_pages)
 	if (ret)
 		return ret;
 
-	ret = __pkvm_topup_hyp_alloc_mgt_mc(HYP_ALLOC_MGT_HEAP_ID, &mc);
+	ret = kvm_call_hyp_nvhe(__pkvm_hyp_alloc_mgt_refill, HYP_ALLOC_MGT_HEAP_ID,
+				mc.head, mc.nr_pages);
 	if (ret)
 		free_hyp_memcache(&mc);
 
@@ -1770,12 +1650,10 @@ int __pkvm_topup_hyp_alloc_mgt_gfp(unsigned long id, unsigned long nr_pages,
 	if (ret)
 		return ret;
 
-	ret = __pkvm_topup_hyp_alloc_mgt_mc(id, &mc);
-	if (ret) {
-		kvm_err("Failed topup %ld pages = %ld, size = %ld err = %d, freeing %ld pages\n",
-			id, nr_pages, sz_alloc, ret, mc.nr_pages);
+	ret = kvm_call_hyp_nvhe(__pkvm_hyp_alloc_mgt_refill, id,
+				mc.head, mc.nr_pages);
+	if (ret)
 		free_hyp_memcache(&mc);
-	}
 
 	return ret;
 }
@@ -2010,9 +1888,6 @@ int pkvm_pgtable_stage2_flush(struct kvm_pgtable *pgt, u64 addr, u64 size)
 	struct kvm *kvm = kvm_s2_mmu_to_kvm(pgt->mmu);
 	struct pkvm_mapping *mapping;
 
-	if (cpus_have_final_cap(ARM64_HAS_STAGE2_FWB) && !(pgt->flags & KVM_PGTABLE_S2_NOFWB))
-		return 0;
-
 	lockdep_assert_held(&kvm->mmu_lock);
 	for_each_mapping_in_range_safe(pgt, addr, addr + size, mapping)
 		__clean_dcache_guest_page(pfn_to_kaddr(mapping->pfn), PAGE_SIZE * mapping->nr_pages);
@@ -2061,49 +1936,10 @@ int pkvm_pgtable_stage2_split(struct kvm_pgtable *pgt, u64 addr, u64 size, void 
 	return -EINVAL;
 }
 
-static int __init early_ffa_unmap_on_lend_cfg(char *arg)
+static int early_ffa_unmap_on_lend_cfg(char *arg)
 {
-	char *token;
-	bool enable;
-
-	if (!arg) {
-		kvm_nvhe_sym(__pkvm_ffa_unmap_on_lend) = PKVM_FFA_UNMAP_ON_LEND_ON;
-		return 0;
-	}
-
-	while ((token = strsep(&arg, ","))) {
-		u64 val;
-
-		if (!*token)
-			continue;
-
-		if (!strcmp(token, "full")) {
-			kvm_nvhe_sym(__pkvm_ffa_unmap_on_lend) = PKVM_FFA_UNMAP_ON_LEND_FULL;
-		} else if (!strncmp(token, "nr_handles=", 11)) {
-			if (kstrtoull(token + 11, 10, &val) || !val) {
-				kvm_err("kvm-arm.ffa-unmap-on-lend: Invalid nr_handles '%s'\n",
-					token + 11);
-				return -EINVAL;
-			}
-			kvm_nvhe_sym(kvm_ffa_spm_nr_pages) =
-				DIV_ROUND_UP(val * KVM_FFA_SPM_HANDLE_SIZE, PAGE_SIZE);
-		} else if (!kstrtobool(token, &enable)) {
-			kvm_nvhe_sym(__pkvm_ffa_unmap_on_lend) = enable;
-		} else {
-			kvm_err("kvm-arm.ffa-unmap-on-lend: Unknown argument '%s'\n", token);
-			return -EINVAL;
-		}
-	}
-
+	static_branch_enable(&kvm_ffa_unmap_on_lend);
 	return 0;
 }
 
 early_param("kvm-arm.ffa-unmap-on-lend", early_ffa_unmap_on_lend_cfg);
-
-static int early_its_hardening_cfg(char *arg)
-{
-	static_branch_enable(&kvm_its_hardening);
-	return 0;
-}
-
-early_param("kvm-arm.its_hardening", early_its_hardening_cfg);

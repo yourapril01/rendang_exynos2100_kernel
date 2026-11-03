@@ -34,8 +34,8 @@
 #define ARENA_VM_START (MAX_BPF_JIT_REG + 5)
 
 #define check_imm(bits, imm) do {				\
-	if ((((imm) > 0) && ((imm) >> ((bits) - 1))) ||		\
-	    (((imm) < 0) && (~(imm) >> ((bits) - 1)))) {	\
+	if ((((imm) > 0) && ((imm) >> (bits))) ||		\
+	    (((imm) < 0) && (~(imm) >> (bits)))) {		\
 		pr_info("[%2d] imm=%d(0x%x) out of range\n",	\
 			i, imm, imm);				\
 		return -EINVAL;					\
@@ -406,7 +406,6 @@ static void push_callee_regs(struct jit_ctx *ctx)
 		emit(A64_PUSH(A64_R(23), A64_R(24), A64_SP), ctx);
 		emit(A64_PUSH(A64_R(25), A64_R(26), A64_SP), ctx);
 		emit(A64_PUSH(A64_R(27), A64_R(28), A64_SP), ctx);
-		ctx->fp_used = true;
 	} else {
 		find_used_callee_regs(ctx);
 		for (i = 0; i + 1 < ctx->nr_used_callee_reg; i += 2) {
@@ -880,7 +879,7 @@ static void __maybe_unused build_bhb_mitigation(struct jit_ctx *ctx)
 	    arm64_get_spectre_v2_state() == SPECTRE_VULNERABLE)
 		return;
 
-	if (ns_capable_noaudit(&init_user_ns, CAP_SYS_ADMIN))
+	if (capable(CAP_SYS_ADMIN))
 		return;
 
 	if (supports_clearbhb(SCOPE_SYSTEM)) {
@@ -1567,7 +1566,15 @@ emit_cond_jmp:
 
 	/* speculation barrier */
 	case BPF_ST | BPF_NOSPEC:
-		/* See bpf_jit_bypass_spec_v4() */
+		/*
+		 * Nothing required here.
+		 *
+		 * In case of arm64, we rely on the firmware mitigation of
+		 * Speculative Store Bypass as controlled via the ssbd kernel
+		 * parameter. Whenever the mitigation is enabled, it works
+		 * for all of the kernel code with no need to provide any
+		 * additional instructions.
+		 */
 		break;
 
 	/* ST: *(size *)(dst + off) = imm */
@@ -1881,8 +1888,8 @@ struct bpf_prog *bpf_int_jit_compile(struct bpf_prog *prog)
 	extable_offset = round_up(prog_size + PLT_TARGET_SIZE, extable_align);
 	image_size = extable_offset + extable_size;
 	ro_header = bpf_jit_binary_pack_alloc(image_size, &ro_image_ptr,
-					      sizeof(u64), &header, &image_ptr,
-					      jit_fill_hole, was_classic);
+					      sizeof(u32), &header, &image_ptr,
+					      jit_fill_hole);
 	if (!ro_header) {
 		prog = orig_prog;
 		goto out_off;
@@ -2420,7 +2427,7 @@ int arch_bpf_trampoline_size(const struct btf_func_model *m, u32 flags,
 
 void *arch_alloc_bpf_trampoline(unsigned int size)
 {
-	return bpf_prog_pack_alloc(size, jit_fill_hole, false);
+	return bpf_prog_pack_alloc(size, jit_fill_hole);
 }
 
 void arch_free_bpf_trampoline(void *image, unsigned int size)
@@ -2737,17 +2744,6 @@ bool bpf_jit_supports_percpu_insn(void)
 	return true;
 }
 
-bool bpf_jit_bypass_spec_v4(void)
-{
-	/* In case of arm64, we rely on the firmware mitigation of Speculative
-	 * Store Bypass as controlled via the ssbd kernel parameter. Whenever
-	 * the mitigation is enabled, it works for all of the kernel code with
-	 * no need to provide any additional instructions. Therefore, skip
-	 * inserting nospec insns against Spectre v4.
-	 */
-	return true;
-}
-
 bool bpf_jit_inlines_helper_call(s32 imm)
 {
 	switch (imm) {
@@ -2772,7 +2768,8 @@ void bpf_jit_free(struct bpf_prog *prog)
 		 * before freeing it.
 		 */
 		if (jit_data) {
-			bpf_jit_binary_pack_finalize(jit_data->ro_header, jit_data->header);
+			bpf_arch_text_copy(&jit_data->ro_header->size, &jit_data->header->size,
+					   sizeof(jit_data->header->size));
 			kfree(jit_data);
 		}
 		prog->bpf_func -= cfi_get_offset();

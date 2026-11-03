@@ -1418,9 +1418,6 @@ static u64 __kvm_read_sanitised_id_reg(const struct kvm_vcpu *vcpu,
 	case SYS_ID_AA64MMFR3_EL1:
 		val &= ID_AA64MMFR3_EL1_TCRX | ID_AA64MMFR3_EL1_S1POE |
 			ID_AA64MMFR3_EL1_S1PIE;
-
-		if (!system_supports_poe())
-			val &= ~ID_AA64MMFR3_EL1_S1POE;
 		break;
 	case SYS_ID_MMFR4_EL1:
 		val &= ~ARM64_FEATURE_MASK(ID_MMFR4_EL1_CCIDX);
@@ -1768,10 +1765,9 @@ static int set_id_reg(struct kvm_vcpu *vcpu, const struct sys_reg_desc *rd,
 
 	/*
 	 * Once the VM has started the ID registers are immutable. Reject any
-	 * write that does not match the final register value once we have
-	 * got far enough into first running the VM to use the values.
+	 * write that does not match the final register value.
 	 */
-	if (kvm_id_regs_final(vcpu->kvm)) {
+	if (kvm_vm_has_ran_once(vcpu->kvm)) {
 		if (val != read_id_reg(vcpu, rd))
 			ret = -EBUSY;
 		else
@@ -1805,7 +1801,7 @@ void kvm_set_vm_id_reg(struct kvm *kvm, u32 reg, u64 val)
 
 	lockdep_assert_held(&kvm->arch.config_lock);
 
-	if (KVM_BUG_ON(kvm_id_regs_final(kvm) || !p, kvm))
+	if (KVM_BUG_ON(kvm_vm_has_ran_once(kvm) || !p, kvm))
 		return;
 
 	*p = val;
@@ -2031,6 +2027,15 @@ static bool bad_redir_trap(struct kvm_vcpu *vcpu,
 	.val = 0,				\
 }
 
+/* sys_reg_desc initialiser for known cpufeature ID registers */
+#define AA32_ID_SANITISED(name) {		\
+	ID_DESC(name),				\
+	.set_user = set_id_reg,			\
+	.visibility = aa32_id_visibility,	\
+	.reset = kvm_read_sanitised_id_reg,	\
+	.val = 0,				\
+}
+
 /* sys_reg_desc initialiser for writable ID registers */
 #define ID_WRITABLE(name, mask) {		\
 	ID_DESC(name),				\
@@ -2047,19 +2052,6 @@ static bool bad_redir_trap(struct kvm_vcpu *vcpu,
 	.visibility = id_visibility,			\
 	.reset = kvm_read_sanitised_id_reg,		\
 	.val = (mask),					\
-}
-
-/*
- * 32bit ID regs are fully writable when the guest is 32bit
- * capable. Nothing in the KVM code should rely on 32bit features
- * anyway, only 64bit, so let the VMM do its worse.
- */
-#define AA32_ID_WRITABLE(name) {		\
-	ID_DESC(name),				\
-	.set_user = set_id_reg,			\
-	.visibility = aa32_id_visibility,	\
-	.reset = kvm_read_sanitised_id_reg,	\
-	.val = GENMASK(31, 0),			\
 }
 
 /*
@@ -2248,39 +2240,40 @@ static const struct sys_reg_desc sys_reg_descs[] = {
 
 	/* AArch64 mappings of the AArch32 ID registers */
 	/* CRm=1 */
-	AA32_ID_WRITABLE(ID_PFR0_EL1),
-	AA32_ID_WRITABLE(ID_PFR1_EL1),
+	AA32_ID_SANITISED(ID_PFR0_EL1),
+	AA32_ID_SANITISED(ID_PFR1_EL1),
 	{ SYS_DESC(SYS_ID_DFR0_EL1),
 	  .access = access_id_reg,
 	  .get_user = get_id_reg,
 	  .set_user = set_id_dfr0_el1,
 	  .visibility = aa32_id_visibility,
 	  .reset = read_sanitised_id_dfr0_el1,
-	  .val = GENMASK(31, 0), },
+	  .val = ID_DFR0_EL1_PerfMon_MASK |
+		 ID_DFR0_EL1_CopDbg_MASK, },
 	ID_HIDDEN(ID_AFR0_EL1),
-	AA32_ID_WRITABLE(ID_MMFR0_EL1),
-	AA32_ID_WRITABLE(ID_MMFR1_EL1),
-	AA32_ID_WRITABLE(ID_MMFR2_EL1),
-	AA32_ID_WRITABLE(ID_MMFR3_EL1),
+	AA32_ID_SANITISED(ID_MMFR0_EL1),
+	AA32_ID_SANITISED(ID_MMFR1_EL1),
+	AA32_ID_SANITISED(ID_MMFR2_EL1),
+	AA32_ID_SANITISED(ID_MMFR3_EL1),
 
 	/* CRm=2 */
-	AA32_ID_WRITABLE(ID_ISAR0_EL1),
-	AA32_ID_WRITABLE(ID_ISAR1_EL1),
-	AA32_ID_WRITABLE(ID_ISAR2_EL1),
-	AA32_ID_WRITABLE(ID_ISAR3_EL1),
-	AA32_ID_WRITABLE(ID_ISAR4_EL1),
-	AA32_ID_WRITABLE(ID_ISAR5_EL1),
-	AA32_ID_WRITABLE(ID_MMFR4_EL1),
-	AA32_ID_WRITABLE(ID_ISAR6_EL1),
+	AA32_ID_SANITISED(ID_ISAR0_EL1),
+	AA32_ID_SANITISED(ID_ISAR1_EL1),
+	AA32_ID_SANITISED(ID_ISAR2_EL1),
+	AA32_ID_SANITISED(ID_ISAR3_EL1),
+	AA32_ID_SANITISED(ID_ISAR4_EL1),
+	AA32_ID_SANITISED(ID_ISAR5_EL1),
+	AA32_ID_SANITISED(ID_MMFR4_EL1),
+	AA32_ID_SANITISED(ID_ISAR6_EL1),
 
 	/* CRm=3 */
-	AA32_ID_WRITABLE(MVFR0_EL1),
-	AA32_ID_WRITABLE(MVFR1_EL1),
-	AA32_ID_WRITABLE(MVFR2_EL1),
+	AA32_ID_SANITISED(MVFR0_EL1),
+	AA32_ID_SANITISED(MVFR1_EL1),
+	AA32_ID_SANITISED(MVFR2_EL1),
 	ID_UNALLOCATED(3,3),
-	AA32_ID_WRITABLE(ID_PFR2_EL1),
+	AA32_ID_SANITISED(ID_PFR2_EL1),
 	ID_HIDDEN(ID_DFR1_EL1),
-	AA32_ID_WRITABLE(ID_MMFR5_EL1),
+	AA32_ID_SANITISED(ID_MMFR5_EL1),
 	ID_UNALLOCATED(3,7),
 
 	/* AArch64 ID registers */
@@ -4649,24 +4642,79 @@ void kvm_calculate_traps(struct kvm_vcpu *vcpu)
 			vcpu->arch.hcrx_el2 |= HCRX_EL2_EnFPM;
 	}
 
-	kvm_calculate_fgu_traps(vcpu);
+	if (test_bit(KVM_ARCH_FLAG_FGU_INITIALIZED, &kvm->arch.flags))
+		goto out;
 
+	kvm->arch.fgu[HFGxTR_GROUP] = (HFGxTR_EL2_nAMAIR2_EL1		|
+				       HFGxTR_EL2_nMAIR2_EL1		|
+				       HFGxTR_EL2_nS2POR_EL1		|
+				       HFGxTR_EL2_nACCDATA_EL1		|
+				       HFGxTR_EL2_nSMPRI_EL1_MASK	|
+				       HFGxTR_EL2_nTPIDR2_EL0_MASK);
+
+	if (!kvm_has_feat(kvm, ID_AA64ISAR0_EL1, TLB, OS))
+		kvm->arch.fgu[HFGITR_GROUP] |= (HFGITR_EL2_TLBIRVAALE1OS|
+						HFGITR_EL2_TLBIRVALE1OS	|
+						HFGITR_EL2_TLBIRVAAE1OS	|
+						HFGITR_EL2_TLBIRVAE1OS	|
+						HFGITR_EL2_TLBIVAALE1OS	|
+						HFGITR_EL2_TLBIVALE1OS	|
+						HFGITR_EL2_TLBIVAAE1OS	|
+						HFGITR_EL2_TLBIASIDE1OS	|
+						HFGITR_EL2_TLBIVAE1OS	|
+						HFGITR_EL2_TLBIVMALLE1OS);
+
+	if (!kvm_has_feat(kvm, ID_AA64ISAR0_EL1, TLB, RANGE))
+		kvm->arch.fgu[HFGITR_GROUP] |= (HFGITR_EL2_TLBIRVAALE1	|
+						HFGITR_EL2_TLBIRVALE1	|
+						HFGITR_EL2_TLBIRVAAE1	|
+						HFGITR_EL2_TLBIRVAE1	|
+						HFGITR_EL2_TLBIRVAALE1IS|
+						HFGITR_EL2_TLBIRVALE1IS	|
+						HFGITR_EL2_TLBIRVAAE1IS	|
+						HFGITR_EL2_TLBIRVAE1IS	|
+						HFGITR_EL2_TLBIRVAALE1OS|
+						HFGITR_EL2_TLBIRVALE1OS	|
+						HFGITR_EL2_TLBIRVAAE1OS	|
+						HFGITR_EL2_TLBIRVAE1OS);
+
+	if (!kvm_has_feat(kvm, ID_AA64ISAR2_EL1, ATS1A, IMP))
+		kvm->arch.fgu[HFGITR_GROUP] |= HFGITR_EL2_ATS1E1A;
+
+	if (!kvm_has_feat(kvm, ID_AA64MMFR1_EL1, PAN, PAN2))
+		kvm->arch.fgu[HFGITR_GROUP] |= (HFGITR_EL2_ATS1E1RP |
+						HFGITR_EL2_ATS1E1WP);
+
+	if (!kvm_has_feat(kvm, ID_AA64MMFR3_EL1, S1PIE, IMP))
+		kvm->arch.fgu[HFGxTR_GROUP] |= (HFGxTR_EL2_nPIRE0_EL1 |
+						HFGxTR_EL2_nPIR_EL1);
+
+	if (!kvm_has_feat(kvm, ID_AA64MMFR3_EL1, S1POE, IMP))
+		kvm->arch.fgu[HFGxTR_GROUP] |= (HFGxTR_EL2_nPOR_EL1 |
+						HFGxTR_EL2_nPOR_EL0);
+
+	if (!kvm_has_feat(kvm, ID_AA64PFR0_EL1, AMU, IMP))
+		kvm->arch.fgu[HAFGRTR_GROUP] |= ~(HAFGRTR_EL2_RES0 |
+						  HAFGRTR_EL2_RES1);
+
+	set_bit(KVM_ARCH_FLAG_FGU_INITIALIZED, &kvm->arch.flags);
+out:
 	mutex_unlock(&kvm->arch.config_lock);
 }
 
 /*
- * Do system register finalization that is shared by the whole guest. This
- * includes last adjustments to the ID registers that are implied by the
+ * Perform last adjustments to the ID registers that are implied by the
  * configuration outside of the ID regs themselves, as well as any
  * initialisation that directly depend on these ID registers (such as
  * RES0/RES1 behaviours). This is not the place to configure traps though.
+ *
+ * Because this can be called once per CPU, changes must be idempotent.
  */
-static int kvm_vm_finalize_sys_regs(struct kvm *kvm)
+int kvm_finalize_sys_regs(struct kvm_vcpu *vcpu)
 {
-	lockdep_assert_held(&kvm->arch.config_lock);
+	struct kvm *kvm = vcpu->kvm;
 
-	if (kvm_id_regs_final(kvm))
-		return 0;
+	guard(mutex)(&kvm->arch.config_lock);
 
 	if (!(static_branch_unlikely(&kvm_vgic_global_state.gicv3_cpuif) &&
 	      irqchip_in_kernel(kvm) &&
@@ -4675,27 +4723,8 @@ static int kvm_vm_finalize_sys_regs(struct kvm *kvm)
 		kvm->arch.id_regs[IDREG_IDX(SYS_ID_PFR1_EL1)] &= ~ID_PFR1_EL1_GIC_MASK;
 	}
 
-	set_bit(KVM_ARCH_FLAG_ID_REGS_FINAL, &kvm->arch.flags);
-
-	return 0;
-}
-
-/*
- * Because this can be called once per CPU, changes must be idempotent.
- */
-int kvm_vcpu_finalize_sys_regs(struct kvm_vcpu *vcpu)
-{
-	struct kvm *kvm = vcpu->kvm;
-	int ret;
-
-	guard(mutex)(&kvm->arch.config_lock);
-
-	ret = kvm_vm_finalize_sys_regs(kvm);
-	if (ret)
-		return ret;
-
 	if (vcpu_has_nv(vcpu)) {
-		ret = kvm_init_nv_sysregs(kvm);
+		int ret = kvm_init_nv_sysregs(kvm);
 		if (ret)
 			return ret;
 	}

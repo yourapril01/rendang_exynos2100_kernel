@@ -21,7 +21,6 @@
 #include <nvhe/alloc_mgt.h>
 #include <nvhe/ffa.h>
 #include <nvhe/iommu.h>
-#include <nvhe/its_emulate.h>
 #include <nvhe/mem_protect.h>
 #include <nvhe/modules.h>
 #include <nvhe/mm.h>
@@ -63,9 +62,6 @@ static inline void hyp_reqs_smccc_encode(unsigned long ret, struct kvm_cpu_conte
 	WARN_ON((req->type != KVM_HYP_REQ_TYPE_MEM) && ((req->type != KVM_HYP_LAST_REQ)));
 	req->type = KVM_HYP_LAST_REQ;
 }
-
-/* Number of implemented GICv3 LRs. Used by flush_hyp_vcpu(). */
-unsigned int hyp_gicv3_nr_lr;
 
 void __kvm_hyp_host_forward_smc(struct kvm_cpu_context *host_ctxt);
 
@@ -176,37 +172,14 @@ static void handle_pvm_entry_psci(struct pkvm_hyp_vcpu *hyp_vcpu)
 			unsigned long cpu_id = smccc_get_arg1(&hyp_vcpu->vcpu);
 			struct pkvm_hyp_vcpu *target_vcpu;
 			struct pkvm_hyp_vm *hyp_vm;
-			int prev;
 
 			hyp_vm = pkvm_hyp_vcpu_to_hyp_vm(hyp_vcpu);
 			target_vcpu = pkvm_mpidr_to_hyp_vcpu(hyp_vm, cpu_id);
 
-			/*
-			 * pvm_psci_vcpu_on() resolved this MPIDR before
-			 * forwarding and vcpus[] entries are never removed,
-			 * so a NULL here is an EL2-internal invariant
-			 * violation, not host-reachable.
-			 */
-			WARN_ON(!target_vcpu);
+			if (target_vcpu && READ_ONCE(target_vcpu->power_state) == PSCI_0_2_AFFINITY_LEVEL_ON_PENDING)
+				WRITE_ONCE(target_vcpu->power_state, PSCI_0_2_AFFINITY_LEVEL_OFF);
 
-			prev = cmpxchg_relaxed(&target_vcpu->power_state,
-					       PSCI_0_2_AFFINITY_LEVEL_ON_PENDING,
-					       PSCI_0_2_AFFINITY_LEVEL_OFF);
-			/*
-			 * Rollback win (prior == ON_PENDING): target never ran.
-			 * Clear reset_state->reset so a future smp_load_acquire
-			 * doesn't pair with this cancelled cycle's release, and
-			 * report INTERNAL_FAILURE. Otherwise the target's reset
-			 * advanced past ON_PENDING (possibly on to OFF via its
-			 * own CPU_OFF), so per PSCI the guest sees SUCCESS.
-			 */
-			if (prev == PSCI_0_2_AFFINITY_LEVEL_ON_PENDING) {
-				WRITE_ONCE(target_vcpu->vcpu.arch.reset_state.reset,
-					   false);
-				ret = PSCI_RET_INTERNAL_FAILURE;
-			} else {
-				ret = PSCI_RET_SUCCESS;
-			}
+			ret = PSCI_RET_INTERNAL_FAILURE;
 		}
 
 		break;
@@ -228,9 +201,6 @@ static void handle_pvm_entry_hvc64(struct pkvm_hyp_vcpu *hyp_vcpu)
 		fallthrough;
 	case ARM_SMCCC_VENDOR_HYP_KVM_MEM_RELINQUISH_FUNC_ID:
 		vcpu_set_reg(&hyp_vcpu->vcpu, 0, SMCCC_RET_SUCCESS);
-		break;
-	case ARM_SMCCC_VENDOR_HYP_KVM_DEV_REQ_PWR_FUNC_ID:
-		pkvm_device_request_power_pvm_entry(hyp_vcpu);
 		break;
 	default:
 		handle_pvm_entry_psci(hyp_vcpu);
@@ -401,7 +371,6 @@ static void handle_pvm_exit_hvc64(struct pkvm_hyp_vcpu *hyp_vcpu)
 
 	case PSCI_1_1_FN_SYSTEM_RESET2:
 	case PSCI_1_1_FN64_SYSTEM_RESET2:
-	case ARM_SMCCC_VENDOR_HYP_KVM_DEV_REQ_PWR_FUNC_ID:
 		n = 3;
 		break;
 
@@ -834,12 +803,10 @@ static void flush_hyp_vcpu(struct pkvm_hyp_vcpu *hyp_vcpu)
 	 * vcpu.
 	 */
 	if (!pkvm_hyp_vcpu_is_protected(hyp_vcpu)) {
-		u8 host_iflags = READ_ONCE(host_vcpu->arch.iflags);
-
-		if (host_iflags & unpack_vcpu_flag(PKVM_HOST_STATE_DIRTY))
+		if (vcpu_get_flag(host_vcpu, PKVM_HOST_STATE_DIRTY))
 			__flush_hyp_vcpu(hyp_vcpu);
 
-		hyp_vcpu->vcpu.arch.iflags = host_iflags;
+		hyp_vcpu->vcpu.arch.iflags = READ_ONCE(host_vcpu->arch.iflags);
 		flush_debug_state(hyp_vcpu);
 
 		hyp_vcpu->vcpu.arch.hcr_el2 &= ~(HCR_TWI | HCR_TWE);
@@ -876,12 +843,6 @@ static void flush_hyp_vcpu(struct pkvm_hyp_vcpu *hyp_vcpu)
 	}
 
 	hyp_vcpu->exit_code = 0;
-
-	/* Bound used_lrs by the number of implemented list registers. */
-	hyp_vcpu->vcpu.arch.vgic_cpu.vgic_v3.used_lrs =
-		min_t(unsigned int,
-		      hyp_vcpu->vcpu.arch.vgic_cpu.vgic_v3.used_lrs,
-		      hyp_gicv3_nr_lr);
 }
 
 static void sync_hyp_vcpu(struct pkvm_hyp_vcpu *hyp_vcpu, u64 *exit_code)
@@ -1065,16 +1026,11 @@ static void handle___kvm_vcpu_run(struct kvm_cpu_context *host_ctxt)
 		if (unlikely(system_supports_sme() && read_sysreg_s(SYS_SVCR)))
 			goto out;
 
-		switch (READ_ONCE(hyp_vcpu->power_state)) {
-		case PSCI_0_2_AFFINITY_LEVEL_ON:
-			break;
-		case PSCI_0_2_AFFINITY_LEVEL_ON_PENDING:
-			if (pkvm_reset_vcpu(hyp_vcpu))
-				goto out;
-			break;
-		default:
+		if (hyp_vcpu->power_state == PSCI_0_2_AFFINITY_LEVEL_ON_PENDING)
+			pkvm_reset_vcpu(hyp_vcpu);
+
+		if (unlikely(hyp_vcpu->power_state != PSCI_0_2_AFFINITY_LEVEL_ON))
 			goto out;
-		}
 
 		flush_hyp_vcpu(hyp_vcpu);
 		ret = __kvm_vcpu_run(&hyp_vcpu->vcpu);
@@ -1278,10 +1234,6 @@ static void handle___pkvm_host_split_guest(struct kvm_cpu_context *host_ctxt)
 	if (!pkvm_hyp_vcpu_is_protected(hyp_vcpu))
 		goto out;
 
-	ret = pkvm_refill_memcache(hyp_vcpu);
-	if (ret)
-		goto out;
-
 	ret = __pkvm_host_split_guest(gfn, size, hyp_vcpu);
 
 out:
@@ -1346,32 +1298,6 @@ static void handle___kvm_tlb_flush_vmid(struct kvm_cpu_context *host_ctxt)
 	DECLARE_REG(struct kvm_s2_mmu *, mmu, host_ctxt, 1);
 
 	__kvm_tlb_flush_vmid(kern_hyp_va(mmu));
-}
-
-static void handle___pkvm_init_its_emulation(struct kvm_cpu_context *host_ctxt)
-{
-	DECLARE_REG(phys_addr_t, dev_addr, host_ctxt, 1);
-	DECLARE_REG(void *, priv_its_state, host_ctxt, 2);
-	DECLARE_REG(size_t, priv_num_pages, host_ctxt, 3);
-	DECLARE_REG(struct its_shadow_tables *, shadow, host_ctxt, 4);
-
-	if (!is_protected_kvm_enabled())
-		return;
-
-	cpu_reg(host_ctxt, 1) = pkvm_init_gic_its_emulation(dev_addr, priv_its_state,
-							    priv_num_pages, shadow);
-}
-
-static void handle___pkvm_init_redist_emulation(struct kvm_cpu_context *host_ctxt)
-{
-	DECLARE_REG(phys_addr_t, dev_addr, host_ctxt, 1);
-	DECLARE_REG(void *, redist_state, host_ctxt, 2);
-
-	if (!is_protected_kvm_enabled())
-		return;
-
-	cpu_reg(host_ctxt, 1) =
-		pkvm_init_redist_emulation(dev_addr, redist_state);
 }
 
 static void handle___pkvm_tlb_flush_vmid(struct kvm_cpu_context *host_ctxt)
@@ -1637,7 +1563,9 @@ static void handle___pkvm_load_tracing(struct kvm_cpu_context *host_ctxt)
 
 static void handle___pkvm_teardown_tracing(struct kvm_cpu_context *host_ctxt)
 {
-	cpu_reg(host_ctxt, 1) = __pkvm_teardown_tracing();
+	__pkvm_teardown_tracing();
+
+	cpu_reg(host_ctxt, 1) = 0;
 }
 
 static void handle___pkvm_enable_tracing(struct kvm_cpu_context *host_ctxt)
@@ -1707,20 +1635,15 @@ static void handle___pkvm_map_module_page(struct kvm_cpu_context *host_ctxt)
 	DECLARE_REG(void *, va, host_ctxt, 2);
 	DECLARE_REG(enum kvm_pgtable_prot, prot, host_ctxt, 3);
 
-	cpu_reg(host_ctxt, 1) = (u64)__pkvm_map_module_pages(pfn, va, 1, prot, false);
+	cpu_reg(host_ctxt, 1) = (u64)__pkvm_map_module_page(pfn, va, prot, false);
 }
 
 static void handle___pkvm_unmap_module_page(struct kvm_cpu_context *host_ctxt)
 {
 	DECLARE_REG(u64, pfn, host_ctxt, 1);
 	DECLARE_REG(void *, va, host_ctxt, 2);
-	int ret;
 
-	ret = __pkvm_unmap_module_pages(pfn, va, 1);
-	if (!ret)
-		WARN_ON(__pkvm_hyp_donate_host(pfn, 1));
-
-	cpu_reg(host_ctxt, 1) = ret;
+	__pkvm_unmap_module_page(pfn, va);
 }
 
 static void handle___pkvm_init_module(struct kvm_cpu_context *host_ctxt)
@@ -1748,8 +1671,6 @@ static void handle___pkvm_hyp_alloc_mgt_refill(struct kvm_cpu_context *host_ctxt
 	};
 
 	cpu_reg(host_ctxt, 1) = hyp_alloc_mgt_refill(id, &mc);
-	cpu_reg(host_ctxt, 2) = mc.head;
-	cpu_reg(host_ctxt, 3) = mc.nr_pages;
 }
 
 static void handle___pkvm_hyp_alloc_mgt_reclaimable(struct kvm_cpu_context *host_ctxt)
@@ -1790,30 +1711,6 @@ static void handle___pkvm_host_iommu_free_domain(struct kvm_cpu_context *host_ct
 	hyp_reqs_smccc_encode(ret, host_ctxt, this_cpu_ptr(&host_hyp_reqs));
 }
 
-static void handle___pkvm_host_iommu_iotlb_inv_nested_domain(struct kvm_cpu_context *host_ctxt)
-{
-	int ret;
-	DECLARE_REG(pkvm_handle_t, domain, host_ctxt, 1);
-	DECLARE_REG(unsigned long, iova, host_ctxt, 2);
-	DECLARE_REG(size_t, size, host_ctxt, 3);
-	DECLARE_REG(size_t, granule, host_ctxt, 4);
-	DECLARE_REG(bool, leaf, host_ctxt, 5);
-
-	ret = kvm_iommu_iotlb_inv_nested_domain(domain, iova, size, granule, leaf);
-	hyp_reqs_smccc_encode(ret, host_ctxt, this_cpu_ptr(&host_hyp_reqs));
-}
-
-static void handle___pkvm_host_iommu_nested_cfg_sync(struct kvm_cpu_context *host_ctxt)
-{
-	int ret;
-	DECLARE_REG(pkvm_handle_t, iommu, host_ctxt, 1);
-	DECLARE_REG(void *, cmd_desc_hva, host_ctxt, 2);
-	DECLARE_REG(size_t, cmd_desc_size, host_ctxt, 3);
-
-	ret = kvm_iommu_nested_cfg_sync(iommu, cmd_desc_hva, cmd_desc_size);
-	hyp_reqs_smccc_encode(ret, host_ctxt, this_cpu_ptr(&host_hyp_reqs));
-}
-
 static void handle___pkvm_host_iommu_attach_dev(struct kvm_cpu_context *host_ctxt)
 {
 	int ret;
@@ -1829,22 +1726,6 @@ static void handle___pkvm_host_iommu_attach_dev(struct kvm_cpu_context *host_ctx
 	hyp_reqs_smccc_encode(ret, host_ctxt, this_cpu_ptr(&host_hyp_reqs));
 }
 
-static void handle___pkvm_host_iommu_attach_dev_nested(struct kvm_cpu_context *host_ctxt)
-{
-	int ret;
-	DECLARE_REG(pkvm_handle_t, iommu, host_ctxt, 1);
-	DECLARE_REG(pkvm_handle_t, domain, host_ctxt, 2);
-	DECLARE_REG(unsigned int, endpoint, host_ctxt, 3);
-	DECLARE_REG(unsigned int, pasid, host_ctxt, 4);
-	DECLARE_REG(unsigned long, flags, host_ctxt, 5);
-	DECLARE_REG(void *, s1_desc_hva, host_ctxt, 6);
-	DECLARE_REG(size_t, s1_desc_size, host_ctxt, 7);
-
-	ret = kvm_iommu_attach_dev_nested(iommu, domain, endpoint, pasid, flags, s1_desc_hva,
-					  s1_desc_size);
-	hyp_reqs_smccc_encode(ret, host_ctxt, this_cpu_ptr(&host_hyp_reqs));
-}
-
 static void handle___pkvm_host_iommu_detach_dev(struct kvm_cpu_context *host_ctxt)
 {
 	int ret;
@@ -1854,18 +1735,6 @@ static void handle___pkvm_host_iommu_detach_dev(struct kvm_cpu_context *host_ctx
 	DECLARE_REG(unsigned int, pasid, host_ctxt, 4);
 
 	ret = kvm_iommu_detach_dev(iommu, domain, endpoint, pasid);
-	hyp_reqs_smccc_encode(ret, host_ctxt, this_cpu_ptr(&host_hyp_reqs));
-}
-
-static void handle___pkvm_host_iommu_detach_dev_nested(struct kvm_cpu_context *host_ctxt)
-{
-	int ret;
-	DECLARE_REG(pkvm_handle_t, iommu, host_ctxt, 1);
-	DECLARE_REG(pkvm_handle_t, domain, host_ctxt, 2);
-	DECLARE_REG(unsigned int, endpoint, host_ctxt, 3);
-	DECLARE_REG(unsigned int, pasid, host_ctxt, 4);
-
-	ret = kvm_iommu_detach_dev_nested(iommu, domain, endpoint, pasid);
 	hyp_reqs_smccc_encode(ret, host_ctxt, this_cpu_ptr(&host_hyp_reqs));
 }
 
@@ -1905,17 +1774,6 @@ static void handle___pkvm_host_iommu_iova_to_phys(struct kvm_cpu_context *host_c
 	DECLARE_REG(unsigned long, iova, host_ctxt, 2);
 
 	cpu_reg(host_ctxt, 1) = kvm_iommu_iova_to_phys(domain, iova);
-}
-
-static void handle___pkvm_host_iommu_iotlb_sync_map(struct kvm_cpu_context *host_ctxt)
-{
-	unsigned long ret;
-	DECLARE_REG(pkvm_handle_t, domain, host_ctxt, 1);
-	DECLARE_REG(unsigned long, iova, host_ctxt, 2);
-	DECLARE_REG(size_t, size, host_ctxt, 3);
-
-	ret = kvm_iommu_iotlb_sync_map(domain, iova, size);
-	hyp_reqs_smccc_encode(ret, host_ctxt, this_cpu_ptr(&host_hyp_reqs));
 }
 
 static void handle___pkvm_host_hvc_pd(struct kvm_cpu_context *host_ctxt)
@@ -2117,15 +1975,10 @@ static const hcall_t host_hcall[] = {
 	HANDLE_FUNC(__pkvm_host_iommu_alloc_domain),
 	HANDLE_FUNC(__pkvm_host_iommu_free_domain),
 	HANDLE_FUNC(__pkvm_host_iommu_attach_dev),
-	HANDLE_FUNC(__pkvm_host_iommu_attach_dev_nested),
 	HANDLE_FUNC(__pkvm_host_iommu_detach_dev),
-	HANDLE_FUNC(__pkvm_host_iommu_detach_dev_nested),
-	HANDLE_FUNC(__pkvm_host_iommu_iotlb_inv_nested_domain),
-	HANDLE_FUNC(__pkvm_host_iommu_nested_cfg_sync),
 	HANDLE_FUNC(__pkvm_host_iommu_map_pages),
 	HANDLE_FUNC(__pkvm_host_iommu_unmap_pages),
 	HANDLE_FUNC(__pkvm_host_iommu_iova_to_phys),
-	HANDLE_FUNC(__pkvm_host_iommu_iotlb_sync_map),
 	HANDLE_FUNC(__pkvm_host_hvc_pd),
 	HANDLE_FUNC(__pkvm_ptdump),
 	HANDLE_FUNC(__pkvm_host_iommu_map_sg),
@@ -2135,8 +1988,6 @@ static const hcall_t host_hcall[] = {
 	HANDLE_FUNC(__pkvm_pviommu_attach),
 	HANDLE_FUNC(__pkvm_pviommu_add_vsid),
 	HANDLE_FUNC(__pkvm_host_get_ffa_version),
-	HANDLE_FUNC(__pkvm_init_its_emulation),
-	HANDLE_FUNC(__pkvm_init_redist_emulation),
 };
 
 static void handle_host_hcall(struct kvm_cpu_context *host_ctxt)

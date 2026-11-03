@@ -10,6 +10,7 @@
  * ... kbuild will automatically pick these up from <asm/asm-prototypes.h> and
  * feed this to genksyms when building assembly files.
  */
+#include <linux/uh.h>
 #include <linux/arm-smccc.h>
 
 #include <asm/ftrace.h>

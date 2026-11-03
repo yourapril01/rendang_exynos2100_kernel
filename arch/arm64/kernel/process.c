@@ -26,7 +26,6 @@
 #include <linux/reboot.h>
 #include <linux/interrupt.h>
 #include <linux/init.h>
-#include <linux/cpumask.h>
 #include <linux/cpu.h>
 #include <linux/elfcore.h>
 #include <linux/pm.h>
@@ -251,6 +250,17 @@ void show_regs(struct pt_regs *regs)
 }
 EXPORT_SYMBOL_GPL(show_regs);
 
+#if IS_ENABLED(CONFIG_SEC_DEBUG_AUTO_COMMENT)
+void show_regs_auto_comment(struct pt_regs *regs, bool comm)
+{
+	__show_regs(regs);
+	if (comm)
+		dump_backtrace_auto_comment(regs, NULL);
+	else
+		dump_backtrace(regs, NULL, KERN_DEFAULT);
+}
+#endif
+
 static void tls_thread_flush(void)
 {
 	write_sysreg(0, tpidr_el0);
@@ -425,6 +435,13 @@ int copy_thread(struct task_struct *p, const struct kernel_clone_args *args)
 				ret = copy_thread_za(p, current);
 				if (ret)
 					return ret;
+				/*
+				 * Disable the SME DVMSync workaround for the
+				 * new process, it will be enabled on return
+				 * to user if TIF_SME is set.
+				 */
+				if (cpus_have_final_cap(ARM64_WORKAROUND_SME_DVMSYNC))
+					p->mm->context.flags &= ~MMCF_SME_DVMSYNC;
 			} else {
 				p->thread.tpidr2_el0 = 0;
 				WARN_ON_ONCE(p->thread.svcr & SVCR_ZA_MASK);
@@ -582,11 +599,6 @@ static void permission_overlay_switch(struct task_struct *next)
 	current->thread.por_el0 = read_sysreg_s(SYS_POR_EL0);
 	if (current->thread.por_el0 != next->thread.por_el0) {
 		write_sysreg_s(next->thread.por_el0, SYS_POR_EL0);
-		/*
-		 * No ISB required as we can tolerate spurious Overlay faults -
-		 * the fault handler will check again based on the new value
-		 * of POR_EL0.
-		 */
 	}
 }
 

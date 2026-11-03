@@ -18,10 +18,10 @@
 #define MIN_ALLOC 8UL
 
 static DEFINE_PER_CPU(int, hyp_allocator_errno);
+static DEFINE_PER_CPU(struct kvm_hyp_memcache, hyp_allocator_mc);
 static DEFINE_PER_CPU(u8, hyp_allocator_missing_donations);
 
 static struct hyp_allocator {
-	struct kvm_hyp_memcache	mc;
 	struct list_head	chunks;
 	unsigned long		start;
 	u32			size;
@@ -149,7 +149,7 @@ static inline void chunk_list_del(struct chunk_hdr *chunk,
 static void hyp_allocator_unmap(struct hyp_allocator *allocator,
 				unsigned long va, size_t size)
 {
-	struct kvm_hyp_memcache *mc = &allocator->mc;
+	struct kvm_hyp_memcache *mc = this_cpu_ptr(&hyp_allocator_mc);
 	int nr_pages = size >> PAGE_SHIFT;
 	unsigned long __va = va;
 
@@ -170,7 +170,7 @@ static void hyp_allocator_unmap(struct hyp_allocator *allocator,
 static int hyp_allocator_map(struct hyp_allocator *allocator,
 			     unsigned long va, size_t size)
 {
-	struct kvm_hyp_memcache *mc = &allocator->mc;
+	struct kvm_hyp_memcache *mc = this_cpu_ptr(&hyp_allocator_mc);
 	unsigned long va_end = va + size;
 	int ret, nr_pages = 0;
 
@@ -552,12 +552,6 @@ void *hyp_alloc(size_t size)
 	size_t missing_map;
 	int ret = 0;
 
-	/* constrained by chunk_hdr *_size types */
-	if (size > U32_MAX) {
-		ret = -E2BIG;
-		goto end_unlocked;
-	}
-
 	size = ALIGN(size ?: MIN_ALLOC, MIN_ALLOC);
 
 	hyp_spin_lock(&allocator->lock);
@@ -593,11 +587,9 @@ void *hyp_alloc(size_t size)
 	}
 
 	WARN_ON(chunk_install(chunk, size, last_chunk, allocator));
-
 end:
 	hyp_spin_unlock(&allocator->lock);
 
-end_unlocked:
 	*(this_cpu_ptr(&hyp_allocator_errno)) = ret;
 
 	/* Enforce zeroing allocated memory */
@@ -644,7 +636,6 @@ void hyp_free(void *addr)
 	prev_chunk = chunk_get_prev(chunk, allocator);
 	next_chunk = chunk_get_next(chunk, allocator);
 
-	WARN_ON(!chunk->alloc_size);
 	chunk->alloc_size = 0;
 	chunk_hash_update(chunk);
 
@@ -719,6 +710,7 @@ int hyp_alloc_reclaimable(void)
 	struct hyp_allocator *allocator = &hyp_allocator;
 	struct chunk_hdr *chunk;
 	int reclaimable = 0;
+	int cpu;
 
 	hyp_spin_lock(&allocator->lock);
 
@@ -730,7 +722,11 @@ int hyp_alloc_reclaimable(void)
 	list_for_each_entry(chunk, &allocator->chunks, node)
 		reclaimable += chunk_reclaimable(chunk, allocator) >> PAGE_SHIFT;
 
-	reclaimable += allocator->mc.nr_pages;
+	for (cpu = 0; cpu < hyp_nr_cpus; cpu++) {
+		struct kvm_hyp_memcache *mc = per_cpu_ptr(&hyp_allocator_mc, cpu);
+
+		reclaimable += mc->nr_pages;
+	}
 
 	hyp_spin_unlock(&allocator->lock);
 
@@ -740,25 +736,31 @@ int hyp_alloc_reclaimable(void)
 void hyp_alloc_reclaim(struct kvm_hyp_memcache *mc, int target)
 {
 	struct hyp_allocator *allocator = &hyp_allocator;
+	struct kvm_hyp_memcache *alloc_mc;
 	struct chunk_hdr *chunk, *tmp;
+	int cpu;
 
 	if (target <= 0)
 		return;
 
 	hyp_spin_lock(&allocator->lock);
 
-	/* Start emptying the common memcache */
-	while (allocator->mc.nr_pages) {
-		unsigned long order;
-		void *page = pop_hyp_memcache(&allocator->mc, hyp_phys_to_virt, &order);
+	/* Start emptying potential unused memcache */
+	for (cpu = 0; cpu < hyp_nr_cpus; cpu++) {
+		alloc_mc = per_cpu_ptr(&hyp_allocator_mc, cpu);
 
-		WARN_ON(order);
-		push_hyp_memcache(mc, page, hyp_virt_to_phys, 0);
-		WARN_ON(__pkvm_hyp_donate_host(hyp_virt_to_pfn(page), 1));
+		while (alloc_mc->nr_pages) {
+			unsigned long order;
+			void *page = pop_hyp_memcache(alloc_mc, hyp_phys_to_virt, &order);
 
-		target--;
-		if (target <= 0)
-			goto done;
+			WARN_ON(order);
+			push_hyp_memcache(mc, page, hyp_virt_to_phys, 0);
+			WARN_ON(__pkvm_hyp_donate_host(hyp_virt_to_pfn(page), 1));
+
+			target--;
+			if (target <= 0)
+				goto done;
+		}
 	}
 
 	list_for_each_entry_safe_reverse(chunk, tmp, &allocator->chunks, node) {
@@ -774,9 +776,10 @@ void hyp_alloc_reclaim(struct kvm_hyp_memcache *mc, int target)
 			break;
 	}
 
-	while (allocator->mc.nr_pages) {
+	alloc_mc = this_cpu_ptr(&hyp_allocator_mc);
+	while (alloc_mc->nr_pages) {
 		unsigned long order;
-		void *page = pop_hyp_memcache(&allocator->mc, hyp_phys_to_virt, &order);
+		void *page = pop_hyp_memcache(alloc_mc, hyp_phys_to_virt, &order);
 
 		WARN_ON(order);
 		memset(page, 0, PAGE_SIZE);
@@ -790,15 +793,10 @@ done:
 
 int hyp_alloc_refill(struct kvm_hyp_memcache *host_mc)
 {
-	struct hyp_allocator *allocator = &hyp_allocator;
-	int ret;
+	struct kvm_hyp_memcache *alloc_mc = this_cpu_ptr(&hyp_allocator_mc);
 
-	hyp_spin_lock(&allocator->lock);
-	ret = refill_memcache(&allocator->mc, host_mc->nr_pages + allocator->mc.nr_pages,
-			      host_mc);
-	hyp_spin_unlock(&allocator->lock);
-
-	return ret;
+	return refill_memcache(alloc_mc, host_mc->nr_pages + alloc_mc->nr_pages,
+			       host_mc);
 }
 
 int hyp_alloc_init(size_t size)
@@ -819,7 +817,6 @@ int hyp_alloc_init(size_t size)
 	allocator->size = size;
 	INIT_LIST_HEAD(&allocator->chunks);
 	hyp_spin_lock_init(&allocator->lock);
-	init_hyp_memcache(&allocator->mc);
 
 	return 0;
 }

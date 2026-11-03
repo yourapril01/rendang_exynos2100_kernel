@@ -302,9 +302,6 @@ static inline void ___activate_traps(struct kvm_vcpu *vcpu, u64 hcr)
 	if (cpus_have_final_cap(ARM64_WORKAROUND_CAVIUM_TX2_219_TVM))
 		hcr |= HCR_TVM;
 
-	if (!system_supports_mte())
-		hcr &= ~(HCR_DCT | HCR_ATA);
-
 	write_sysreg(hcr, hcr_el2);
 
 	if (cpus_have_final_cap(ARM64_HAS_RAS_EXTN) && (hcr & HCR_VSE))
@@ -332,19 +329,16 @@ static inline bool __populate_fault_info(struct kvm_vcpu *vcpu)
 
 static inline bool kvm_hyp_handle_mops(struct kvm_vcpu *vcpu, u64 *exit_code)
 {
-	u64 spsr;
-
 	*vcpu_pc(vcpu) = read_sysreg_el2(SYS_ELR);
 	arm64_mops_reset_regs(vcpu_gp_regs(vcpu), vcpu->arch.fault.esr_el2);
 	write_sysreg_el2(*vcpu_pc(vcpu), SYS_ELR);
 
 	/*
 	 * Finish potential single step before executing the prologue
-	 * instruction. Modify the hardware SPSR_EL2 directly, as vcpu_cpsr()
-	 * may hold a synthetic (vEL2) value for a guest hypervisor.
+	 * instruction.
 	 */
-	spsr = read_sysreg_el2(SYS_SPSR);
-	write_sysreg_el2(spsr & ~DBG_SPSR_SS, SYS_SPSR);
+	*vcpu_cpsr(vcpu) &= ~DBG_SPSR_SS;
+	write_sysreg_el2(*vcpu_cpsr(vcpu), SYS_SPSR);
 
 	return true;
 }
@@ -413,7 +407,7 @@ static inline void fpsimd_lazy_switch_to_host(struct kvm_vcpu *vcpu)
 	/*
 	 * When the guest owns the FP regs, we know that guest+hyp traps for
 	 * any FPSIMD/SVE/SME features exposed to the guest have been disabled
-	 * by either __activate_cptr_traps() or kvm_hyp_handle_fpsimd()
+	 * by either fpsimd_lazy_switch_to_guest() or kvm_hyp_handle_fpsimd()
 	 * prior to __guest_entry(). As __guest_entry() guarantees a context
 	 * synchronization event, we don't need an ISB here to avoid taking
 	 * traps for anything that was exposed to the guest.
@@ -488,6 +482,8 @@ static inline bool kvm_hyp_handle_fpsimd(struct kvm_vcpu *vcpu, u64 *exit_code)
 			return false;
 		break;
 	case ESR_ELx_EC_SYS64:
+		if (WARN_ON_ONCE(!is_hyp_ctxt(vcpu)))
+			return false;
 		fallthrough;
 	case ESR_ELx_EC_SVE:
 		if (!sve_guest)

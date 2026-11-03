@@ -174,6 +174,100 @@ static void dump_kernel_instr(const char *lvl, struct pt_regs *regs)
 	printk("%sCode: %s\n", lvl, str);
 }
 
+#if IS_ENABLED(CONFIG_SEC_DEBUG_BUILT)
+static unsigned long __get_par_to_addr(u64 par, unsigned long vaddr)
+{
+	u64 tmp, rpar;
+
+	tmp = (u64)vaddr & (0xfff);
+	rpar = ((par & ~(0xfffUL << 52)) & ~(0xfff));
+	rpar = rpar | tmp;
+
+	return rpar;
+}
+
+static unsigned long secdbg_get_pa_from_mmu(unsigned long vaddr)
+{
+	unsigned long flags;
+	u64 par, dfsc;
+
+	local_irq_save(flags);
+	asm volatile("at s1e1r, %0" :: "r" (vaddr));
+	isb();
+	par = read_sysreg_par();
+	local_irq_restore(flags);
+
+	if (par & SYS_PAR_EL1_F) {
+		dfsc = FIELD_GET(SYS_PAR_EL1_FST, par);
+		pr_err("failed to get v:0x%lx, p:0x%llx, fsc:0x%llx\n",
+			vaddr, par, dfsc);
+		return 0;
+	}
+
+	return __get_par_to_addr(par, vaddr);
+}
+
+static int _dump_kernel_hex_line(unsigned long start_addr, unsigned int lines,
+					unsigned long paddr, unsigned long pc_val)
+{
+	unsigned int val, bad;
+	u32 *addr = (u32 *)start_addr;
+	char str[sizeof(" 00000000 ") * 4 + 1];
+	int i;
+	char *p = str;
+	char *end = p + sizeof(str);
+
+	for (i = 0; i < 4; i++) {
+		bool ispc = (addr + i == (u32 *)pc_val);
+
+		bad = aarch64_insn_read(addr + i, &val);
+
+		if (!bad)
+			p += snprintf(p, end - p, ispc ? "(%08x)" : " %08x ", val);
+		else {
+			p += snprintf(p, end - p, "bad PC value");
+			break;
+		}
+	}
+
+	pr_info(" %9lx :%s\n", paddr, str);
+
+	return bad;
+}
+
+static void secdbg_dump_kernel_instr_ext(struct pt_regs *regs)
+{
+	unsigned long pc_val = instruction_pointer(regs);
+	unsigned long start_addr = (pc_val & ~(0x40 - 1)) - 0x40;
+	unsigned long paddr = 0x0;
+	int i;
+
+	if (user_mode(regs))
+		return;
+
+	for (i = 0; i < 12; i++) {
+		unsigned int bad;
+		u32 *addr = (u32 *)start_addr + 4 * i;
+
+		if (i == 0 || offset_in_page(addr) == 0)
+			paddr = secdbg_get_pa_from_mmu((unsigned long)addr);
+		else
+			paddr += 0x10;
+
+		if (i && (i % 4) == 0)
+			pr_info("\n");
+
+		bad = _dump_kernel_hex_line((unsigned long)addr, 4, paddr, pc_val);
+		if (bad)
+			break;
+	}
+}
+#else
+static inline void secdbg_dump_kernel_instr_ext(struct pt_regs *regs)
+{
+}
+#endif
+
 #ifdef CONFIG_PREEMPT
 #define S_PREEMPT " PREEMPT"
 #elif defined(CONFIG_PREEMPT_RT)
@@ -198,7 +292,12 @@ static int __die(const char *str, long err, struct pt_regs *regs)
 		return ret;
 
 	print_modules();
+#if IS_ENABLED(CONFIG_SEC_DEBUG_AUTO_COMMENT)
+	__show_regs(regs);
+	dump_backtrace_auto_comment(regs, NULL);
+#else
 	show_regs(regs);
+#endif
 
 	dump_kernel_instr(KERN_EMERG, regs);
 
@@ -464,7 +563,7 @@ void do_el0_undef(struct pt_regs *regs, unsigned long esr)
 	u32 insn;
 
 	/* check for AArch32 breakpoint instructions */
-	if (try_handle_aarch32_break(regs))
+	if (!aarch32_break_handler(regs))
 		return;
 
 	if (user_insn_read(regs, &insn))
@@ -491,6 +590,12 @@ void do_el1_undef(struct pt_regs *regs, unsigned long esr)
 		return;
 
 out_err:
+	if (IS_ENABLED(CONFIG_SEC_DEBUG_FAULT_MSG_ADV)) {
+		pr_auto(ASL1, "%s: pc=0x%016llx\n",
+			"Undefined instruction", regs->pc);
+		dump_kernel_instr(KERN_INFO, regs);
+		secdbg_dump_kernel_instr_ext(regs);
+	}
 	trace_android_rvh_do_el1_undef(regs, esr);
 	die("Oops - Undefined instruction", regs, esr);
 }
@@ -507,6 +612,8 @@ void do_el1_bti(struct pt_regs *regs, unsigned long esr)
 		return;
 	}
 
+	if (IS_ENABLED(CONFIG_SEC_DEBUG_FAULT_MSG_ADV))
+		pr_auto(ASL1, "%s: pc=0x%016llx\n", "BTI", regs->pc);
 	trace_android_rvh_do_el1_bti(regs, esr);
 	die("Oops - BTI", regs, esr);
 }
@@ -522,6 +629,9 @@ void do_el1_fpac(struct pt_regs *regs, unsigned long esr)
 	 * Unexpected FPAC exception in the kernel: kill the task before it
 	 * does any more harm.
 	 */
+	if (IS_ENABLED(CONFIG_SEC_DEBUG_FAULT_MSG_ADV))
+		pr_auto(ASL1, "Wrong PAC detected on CPU%d, LR 0x%016llx, code 0x%08lx -- %s\n",
+			smp_processor_id(), regs->regs[30], esr, esr_get_class_string(esr));
 	trace_android_rvh_do_el1_fpac(regs, esr);
 	die("Oops - FPAC", regs, esr);
 }
@@ -927,10 +1037,9 @@ void __noreturn panic_bad_stack(struct pt_regs *regs, unsigned long esr, unsigne
 
 void __noreturn arm64_serror_panic(struct pt_regs *regs, unsigned long esr)
 {
-	add_taint(TAINT_MACHINE_CHECK, LOCKDEP_STILL_OK);
 	console_verbose();
 
-	pr_crit("SError Interrupt on CPU%d, code 0x%016lx -- %s\n",
+	pr_auto(ASL1, "SError Interrupt on CPU%d, code 0x%016lx -- %s\n",
 		smp_processor_id(), esr, esr_get_class_string(esr));
 
 	trace_android_rvh_arm64_serror_panic(regs, esr);
@@ -986,7 +1095,7 @@ void do_serror(struct pt_regs *regs, unsigned long esr)
 int is_valid_bugaddr(unsigned long addr)
 {
 	/*
-	 * bug_brk_handler() only called for BRK #BUG_BRK_IMM.
+	 * bug_handler() only called for BRK #BUG_BRK_IMM.
 	 * So the answer is trivial -- any spurious instances with no
 	 * bug table entry will be rejected by report_bug() and passed
 	 * back to the debug-monitors code and handled as a fatal
@@ -996,7 +1105,7 @@ int is_valid_bugaddr(unsigned long addr)
 }
 #endif
 
-int bug_brk_handler(struct pt_regs *regs, unsigned long esr)
+static int bug_handler(struct pt_regs *regs, unsigned long esr)
 {
 	switch (report_bug(regs->pc, regs)) {
 	case BUG_TRAP_TYPE_BUG:
@@ -1016,8 +1125,13 @@ int bug_brk_handler(struct pt_regs *regs, unsigned long esr)
 	return DBG_HOOK_HANDLED;
 }
 
+static struct break_hook bug_break_hook = {
+	.fn = bug_handler,
+	.imm = BUG_BRK_IMM,
+};
+
 #ifdef CONFIG_CFI_CLANG
-int cfi_brk_handler(struct pt_regs *regs, unsigned long esr)
+static int cfi_handler(struct pt_regs *regs, unsigned long esr)
 {
 	unsigned long target;
 	u32 type;
@@ -1040,9 +1154,15 @@ int cfi_brk_handler(struct pt_regs *regs, unsigned long esr)
 	arm64_skip_faulting_instruction(regs, AARCH64_INSN_SIZE);
 	return DBG_HOOK_HANDLED;
 }
+
+static struct break_hook cfi_break_hook = {
+	.fn = cfi_handler,
+	.imm = CFI_BRK_IMM_BASE,
+	.mask = CFI_BRK_IMM_MASK,
+};
 #endif /* CONFIG_CFI_CLANG */
 
-int reserved_fault_brk_handler(struct pt_regs *regs, unsigned long esr)
+static int reserved_fault_handler(struct pt_regs *regs, unsigned long esr)
 {
 	pr_err("%s generated an invalid instruction at %pS!\n",
 		"Kernel text patching",
@@ -1052,6 +1172,11 @@ int reserved_fault_brk_handler(struct pt_regs *regs, unsigned long esr)
 	return DBG_HOOK_ERROR;
 }
 
+static struct break_hook fault_break_hook = {
+	.fn = reserved_fault_handler,
+	.imm = FAULT_BRK_IMM,
+};
+
 #ifdef CONFIG_KASAN_SW_TAGS
 
 #define KASAN_ESR_RECOVER	0x20
@@ -1059,7 +1184,7 @@ int reserved_fault_brk_handler(struct pt_regs *regs, unsigned long esr)
 #define KASAN_ESR_SIZE_MASK	0x0f
 #define KASAN_ESR_SIZE(esr)	(1 << ((esr) & KASAN_ESR_SIZE_MASK))
 
-int kasan_brk_handler(struct pt_regs *regs, unsigned long esr)
+static int kasan_handler(struct pt_regs *regs, unsigned long esr)
 {
 	bool recover = esr & KASAN_ESR_RECOVER;
 	bool write = esr & KASAN_ESR_WRITE;
@@ -1090,12 +1215,62 @@ int kasan_brk_handler(struct pt_regs *regs, unsigned long esr)
 	arm64_skip_faulting_instruction(regs, AARCH64_INSN_SIZE);
 	return DBG_HOOK_HANDLED;
 }
+
+static struct break_hook kasan_break_hook = {
+	.fn	= kasan_handler,
+	.imm	= KASAN_BRK_IMM,
+	.mask	= KASAN_BRK_MASK,
+};
 #endif
 
 #ifdef CONFIG_UBSAN_TRAP
-int ubsan_brk_handler(struct pt_regs *regs, unsigned long esr)
+static int ubsan_handler(struct pt_regs *regs, unsigned long esr)
 {
 	die(report_ubsan_failure(regs, esr & UBSAN_BRK_MASK), regs, esr);
 	return DBG_HOOK_HANDLED;
 }
+
+static struct break_hook ubsan_break_hook = {
+	.fn	= ubsan_handler,
+	.imm	= UBSAN_BRK_IMM,
+	.mask	= UBSAN_BRK_MASK,
+};
 #endif
+
+/*
+ * Initial handler for AArch64 BRK exceptions
+ * This handler only used until debug_traps_init().
+ */
+int __init early_brk64(unsigned long addr, unsigned long esr,
+		struct pt_regs *regs)
+{
+#ifdef CONFIG_CFI_CLANG
+	if (esr_is_cfi_brk(esr))
+		return cfi_handler(regs, esr) != DBG_HOOK_HANDLED;
+#endif
+#ifdef CONFIG_KASAN_SW_TAGS
+	if ((esr_brk_comment(esr) & ~KASAN_BRK_MASK) == KASAN_BRK_IMM)
+		return kasan_handler(regs, esr) != DBG_HOOK_HANDLED;
+#endif
+#ifdef CONFIG_UBSAN_TRAP
+	if ((esr_brk_comment(esr) & ~UBSAN_BRK_MASK) == UBSAN_BRK_IMM)
+		return ubsan_handler(regs, esr) != DBG_HOOK_HANDLED;
+#endif
+	return bug_handler(regs, esr) != DBG_HOOK_HANDLED;
+}
+
+void __init trap_init(void)
+{
+	register_kernel_break_hook(&bug_break_hook);
+#ifdef CONFIG_CFI_CLANG
+	register_kernel_break_hook(&cfi_break_hook);
+#endif
+	register_kernel_break_hook(&fault_break_hook);
+#ifdef CONFIG_KASAN_SW_TAGS
+	register_kernel_break_hook(&kasan_break_hook);
+#endif
+#ifdef CONFIG_UBSAN_TRAP
+	register_kernel_break_hook(&ubsan_break_hook);
+#endif
+	debug_traps_init();
+}

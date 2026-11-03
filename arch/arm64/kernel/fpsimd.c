@@ -1385,53 +1385,45 @@ void do_sve_acc(unsigned long esr, struct pt_regs *regs)
 	put_cpu_fpsimd_context();
 }
 
-#ifdef CONFIG_ARM64_ERRATUM_4193714
+#ifdef CONFIG_ARM64_ERRATUM_SME_DVMSYNC
 
 /*
- * SME/CME erratum handling.
+ * SME/CME erratum handling
  */
-static cpumask_t sme_dvmsync_cpus;
-cpumask_t sme_active_cpus;
+static cpumask_var_t sme_dvmsync_cpus;
+static cpumask_var_t sme_active_cpus;
 
-/*
- * These helpers are only called from non-preemptible contexts, so
- * smp_processor_id() is safe here.
- */
-void sme_set_active(void)
+void sme_set_active(unsigned int cpu)
 {
-	unsigned int cpu = smp_processor_id();
-
-	if (!cpumask_test_cpu(cpu, &sme_dvmsync_cpus))
+	if (!cpus_have_final_cap(ARM64_WORKAROUND_SME_DVMSYNC))
+		return;
+	if (!cpumask_test_cpu(cpu, sme_dvmsync_cpus))
 		return;
 
-	cpumask_set_cpu(cpu, mm_cpumask(current->mm));
-	cpumask_set_cpu(cpu, &sme_active_cpus);
+	if (!test_bit(MMCF_SME_DVMSYNC, &current->mm->context.flags))
+		set_bit(ilog2(MMCF_SME_DVMSYNC), &current->mm->context.flags);
+
+	cpumask_set_cpu(cpu, sme_active_cpus);
 
 	/*
-	 * A subsequent (post ERET) SME access may use a stale address
-	 * translation. On C1-Pro, a TLBI+DSB on a different CPU will wait for
-	 * the completion of the cpumask_set_cpu() operations above as they
-	 * appear in program order before the SME access. The post-TLBI+DSB
-	 * read of mm_cpumask() or sme_active_cpus will lead to the IPI being
-	 * issued.
-	 *
-	 * https://lore.kernel.org/r/ablEXwhfKyJW1i7l@J2N7QTR9R3
+	 * Ensure subsequent (SME) memory accesses are observed after the
+	 * cpumask and the MMCF_SME_DVMSYNC flag setting.
 	 */
+	smp_mb();
 }
 
-void sme_clear_active(void)
+void sme_clear_active(unsigned int cpu)
 {
-	unsigned int cpu = smp_processor_id();
-
-	if (!cpumask_test_cpu(cpu, &sme_dvmsync_cpus))
+	if (!cpus_have_final_cap(ARM64_WORKAROUND_SME_DVMSYNC))
+		return;
+	if (!cpumask_test_cpu(cpu, sme_dvmsync_cpus))
 		return;
 
 	/*
 	 * With SCTLR_EL1.IESB enabled, the SME memory transactions are
 	 * completed on entering EL1.
 	 */
-	cpumask_clear_cpu(cpu, mm_cpumask(current->mm));
-	cpumask_clear_cpu(cpu, &sme_active_cpus);
+	cpumask_clear_cpu(cpu, sme_active_cpus);
 }
 
 static void sme_dvmsync_ipi(void *unused)
@@ -1443,28 +1435,32 @@ static void sme_dvmsync_ipi(void *unused)
 	 */
 }
 
-void sme_do_dvmsync(const struct cpumask *mask)
+void sme_do_dvmsync(void)
 {
 	/*
 	 * This is called from the TLB maintenance functions after the DSB ISH
-	 * to send the hardware DVMSync message. If this CPU sees the mask as
+	 * to send hardware DVMSync message. If this CPU sees the mask as
 	 * empty, the remote CPU executing sme_set_active() would have seen
 	 * the DVMSync and no IPI required.
 	 */
-	if (cpumask_empty(mask))
+	if (cpumask_empty(sme_active_cpus))
 		return;
 
-	preempt_disable();
-	smp_call_function_many(mask, sme_dvmsync_ipi, NULL, true);
-	preempt_enable();
+	on_each_cpu_mask(sme_active_cpus, sme_dvmsync_ipi, NULL, true);
 }
 
 void sme_enable_dvmsync(void)
 {
-	cpumask_set_cpu(smp_processor_id(), &sme_dvmsync_cpus);
+	if ((!cpumask_available(sme_dvmsync_cpus) &&
+	     !zalloc_cpumask_var(&sme_dvmsync_cpus, GFP_ATOMIC)) ||
+	    (!cpumask_available(sme_active_cpus) &&
+	     !zalloc_cpumask_var(&sme_active_cpus, GFP_ATOMIC)))
+		panic("Unable to allocate the cpumasks for SME DVMSync erratum");
+
+	cpumask_set_cpu(smp_processor_id(), sme_dvmsync_cpus);
 }
 
-#endif /* CONFIG_ARM64_ERRATUM_4193714 */
+#endif /* CONFIG_ARM64_ERRATUM_SME_DVMSYNC */
 
 /*
  * Trapped SME access

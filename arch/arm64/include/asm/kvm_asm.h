@@ -121,15 +121,10 @@ enum __kvm_host_smccc_func {
 	__KVM_HOST_SMCCC_FUNC___pkvm_host_iommu_alloc_domain,
 	__KVM_HOST_SMCCC_FUNC___pkvm_host_iommu_free_domain,
 	__KVM_HOST_SMCCC_FUNC___pkvm_host_iommu_attach_dev,
-	__KVM_HOST_SMCCC_FUNC___pkvm_host_iommu_attach_dev_nested,
 	__KVM_HOST_SMCCC_FUNC___pkvm_host_iommu_detach_dev,
-	__KVM_HOST_SMCCC_FUNC___pkvm_host_iommu_detach_dev_nested,
-	__KVM_HOST_SMCCC_FUNC___pkvm_host_iommu_iotlb_inv_nested_domain,
-	__KVM_HOST_SMCCC_FUNC___pkvm_host_iommu_nested_cfg_sync,
 	__KVM_HOST_SMCCC_FUNC___pkvm_host_iommu_map_pages,
 	__KVM_HOST_SMCCC_FUNC___pkvm_host_iommu_unmap_pages,
 	__KVM_HOST_SMCCC_FUNC___pkvm_host_iommu_iova_to_phys,
-	__KVM_HOST_SMCCC_FUNC___pkvm_host_iommu_iotlb_sync_map,
 	__KVM_HOST_SMCCC_FUNC___pkvm_host_hvc_pd,
 	__KVM_HOST_SMCCC_FUNC___pkvm_ptdump,
 	__KVM_HOST_SMCCC_FUNC___pkvm_host_iommu_map_sg,
@@ -139,8 +134,6 @@ enum __kvm_host_smccc_func {
 	__KVM_HOST_SMCCC_FUNC___pkvm_pviommu_attach,
 	__KVM_HOST_SMCCC_FUNC___pkvm_pviommu_add_vsid,
 	__KVM_HOST_SMCCC_FUNC___pkvm_host_get_ffa_version,
-	__KVM_HOST_SMCCC_FUNC___pkvm_init_its_emulation,
-	__KVM_HOST_SMCCC_FUNC___pkvm_init_redist_emulation,
 
 	/*
 	 * Start of the dynamically registered hypercalls. Start a bit

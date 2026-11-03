@@ -41,11 +41,6 @@
 /*
  * Save/restore interrupts.
  */
-	.macro save_and_disable_daif, flags
-	mrs	\flags, daif
-	msr	daifset, #0xf
-	.endm
-
 	.macro	save_and_disable_irq, flags
 	mrs	\flags, daif
 	msr	daifset, #3
@@ -378,18 +373,16 @@ alternative_endif
  * [start, end) with dcache line size explicitly provided.
  *
  * 	op:		operation passed to dc instruction
+ * 	domain:		domain used in dsb instruciton
  * 	start:          starting virtual address of the region
  * 	end:            end virtual address of the region
  *	linesz:		dcache line size
  * 	fixup:		optional label to branch to on user fault
  * 	Corrupts:       start, end, tmp
  */
-	.macro dcache_by_myline_op_nosync op, start, end, linesz, tmp, fixup
+	.macro dcache_by_myline_op op, domain, start, end, linesz, tmp, fixup
 	sub	\tmp, \linesz, #1
 	bic	\start, \start, \tmp
-alternative_if ARM64_WORKAROUND_4311569
-	mov	\tmp, \start
-alternative_else_nop_endif
 .Ldcache_op\@:
 	.ifc	\op, cvau
 	__dcache_op_workaround_clean_cache \op, \start
@@ -411,46 +404,25 @@ alternative_else_nop_endif
 	add	\start, \start, \linesz
 	cmp	\start, \end
 	b.lo	.Ldcache_op\@
-alternative_if ARM64_WORKAROUND_4311569
-	.ifnc	\op, cvau
-	mov	\start, \tmp
-	mov	\tmp, xzr
-	cbnz	\start, .Ldcache_op\@
-	.endif
-alternative_else_nop_endif
+	dsb	\domain
 
 	_cond_uaccess_extable .Ldcache_op\@, \fixup
 	.endm
 
 /*
  * Macro to perform a data cache maintenance for the interval
- * [start, end) without waiting for completion
+ * [start, end)
  *
  * 	op:		operation passed to dc instruction
- * 	start:          starting virtual address of the region
- * 	end:            end virtual address of the region
- * 	fixup:		optional label to branch to on user fault
- * 	Corrupts:       start, end, tmp1, tmp2
- */
-	.macro dcache_by_line_op_nosync op, start, end, tmp1, tmp2, fixup
-	dcache_line_size \tmp1, \tmp2
-	dcache_by_myline_op_nosync \op, \start, \end, \tmp1, \tmp2, \fixup
-	.endm
-
-/*
- * Macro to perform a data cache maintenance for the interval
- * [start, end) and wait for completion
- *
- * 	op:		operation passed to dc instruction
- * 	domain:		domain used in dsb instruction
+ * 	domain:		domain used in dsb instruciton
  * 	start:          starting virtual address of the region
  * 	end:            end virtual address of the region
  * 	fixup:		optional label to branch to on user fault
  * 	Corrupts:       start, end, tmp1, tmp2
  */
 	.macro dcache_by_line_op op, domain, start, end, tmp1, tmp2, fixup
-	dcache_by_line_op_nosync \op, \start, \end, \tmp1, \tmp2, \fixup
-	dsb \domain
+	dcache_line_size \tmp1, \tmp2
+	dcache_by_myline_op \op, \domain, \start, \end, \tmp1, \tmp2, \fixup
 	.endm
 
 /*

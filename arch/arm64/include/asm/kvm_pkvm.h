@@ -294,37 +294,21 @@ static inline unsigned long pvm_supported_vcpu_features(void)
 	(kvm_has_feat(kvm, ID_AA64ISAR1_EL1, LS64, LS64) ? 0ULL : HCRX_nLS64) | \
 	0
 
-struct pkvm_moveable_reg;
-
-typedef void(pkvm_emulate_handler)(struct pkvm_moveable_reg *region, u64 offset,
-				   bool write, u64 *reg, u8 reg_size);
-
 enum pkvm_moveable_reg_type {
 	PKVM_MREG_MEMORY,
 	PKVM_MREG_PROTECTED_RANGE,
 	PKVM_MREG_ASSIGN_MMIO,
-	PKVM_MREG_EMULATE_MMIO,
 };
 
 struct pkvm_moveable_reg {
 	phys_addr_t start;
 	u64 size;
 	enum pkvm_moveable_reg_type type;
-	pkvm_emulate_handler *cb;
-	void *priv;
 };
 
 #define PKVM_NR_MOVEABLE_REGS 512
 extern struct pkvm_moveable_reg kvm_nvhe_sym(pkvm_moveable_regs)[];
 extern unsigned int kvm_nvhe_sym(pkvm_moveable_regs_nr);
-extern void kvm_nvhe_sym(pkvm_handle_forward_req)(struct pkvm_moveable_reg *region, u64 offset,
-						  bool write, u64 *reg, u8 reg_size);
-extern void kvm_nvhe_sym(pkvm_handle_gic_emulation)(struct pkvm_moveable_reg *region, u64 offset,
-						    bool write, u64 *reg, u8 reg_size);
-extern void kvm_nvhe_sym(pkvm_handle_rdist_emulation)(struct pkvm_moveable_reg *region, u64 offset,
-						      bool write, u64 *reg, u8 reg_size);
-extern void kvm_nvhe_sym(pkvm_handle_vlpi_emulation)(struct pkvm_moveable_reg *region, u64 offset,
-						     bool write, u64 *reg, u8 reg_size);
 
 extern struct memblock_region kvm_nvhe_sym(hyp_memory)[];
 extern unsigned int kvm_nvhe_sym(hyp_memblock_nr);
@@ -432,30 +416,11 @@ static inline unsigned long pkvm_selftest_pages(void) { return 0; }
 #define KVM_FFA_MBOX_NR_PAGES		1
 #define KVM_FFA_SPM_HANDLE_NR_PAGES	2
 
-/* struct ffa_handle is a single 64-bit bitfield, see hyp/nvhe/ffa.c */
-#define KVM_FFA_SPM_HANDLE_SIZE		sizeof(u64)
-
-extern u64 kvm_nvhe_sym(kvm_ffa_spm_nr_pages);
-
 /*
- * Maximum number of constituents allowed in a descriptor. This number is
- * arbitrary, and can be overridden via command line kvm-arm.ffa_max_nr_constituents.
- * See comment below on SG_MAX_SEGMENTS in hyp_ffa_proxy_pages().
+ * Maximum number of consitutents allowed in a descriptor. This number is
+ * arbitrary, see comment below on SG_MAX_SEGMENTS in hyp_ffa_proxy_pages().
  */
 #define KVM_FFA_MAX_NR_CONSTITUENTS	4096
-extern size_t kvm_nvhe_sym(ffa_max_nr_constituents);
-
-enum pkvm_ffa_unmap_on_lend_mode {
-	PKVM_FFA_UNMAP_ON_LEND_OFF = 0,
-	PKVM_FFA_UNMAP_ON_LEND_ON,
-	PKVM_FFA_UNMAP_ON_LEND_FULL,
-};
-
-extern int kvm_nvhe_sym(__pkvm_ffa_unmap_on_lend);
-static inline bool pkvm_ffa_unmap_on_lend(void)
-{
-	return kvm_nvhe_sym(__pkvm_ffa_unmap_on_lend);
-}
 
 static inline unsigned long hyp_ffa_proxy_pages(void)
 {
@@ -471,7 +436,7 @@ static inline unsigned long hyp_ffa_proxy_pages(void)
 	 * it is sometimes abused, so let's allow larger descriptors and hope
 	 * for the best.
 	 */
-	WARN_ON(kvm_nvhe_sym(ffa_max_nr_constituents) < SG_MAX_SEGMENTS);
+	BUILD_BUG_ON(KVM_FFA_MAX_NR_CONSTITUENTS < SG_MAX_SEGMENTS);
 
 	/*
 	 * The hypervisor FFA proxy needs enough memory to buffer a fragmented
@@ -480,13 +445,10 @@ static inline unsigned long hyp_ffa_proxy_pages(void)
 	desc_max = sizeof(struct ffa_mem_region) +
 		   sizeof(struct ffa_mem_region_attributes) +
 		   sizeof(struct ffa_composite_mem_region) +
-		   kvm_nvhe_sym(ffa_max_nr_constituents) * sizeof(struct ffa_mem_region_addr_range);
+		   KVM_FFA_MAX_NR_CONSTITUENTS * sizeof(struct ffa_mem_region_addr_range);
 
 	/* Plus a page each for the hypervisor's RX and TX mailboxes. */
 	num_pages = (2 * KVM_FFA_MBOX_NR_PAGES) + DIV_ROUND_UP(desc_max, PAGE_SIZE);
-
-	if (pkvm_ffa_unmap_on_lend())
-		num_pages += kvm_nvhe_sym(kvm_ffa_spm_nr_pages);
 
 	return num_pages;
 }
@@ -549,6 +511,10 @@ struct pkvm_ptdump_log_hdr {
 	/* The write index in the log page */
 	u64	w_index: 16;
 };
+
+int pkvm_call_hyp_nvhe_ppage(struct kvm_pinned_page *ppage,
+			     int (*call_hyp_nvhe)(u64, u64, u8, void*),
+			     void *args, bool unmap);
 
 struct pkvm_mapping {
 	struct rb_node node;

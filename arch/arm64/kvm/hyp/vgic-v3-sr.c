@@ -212,11 +212,13 @@ void __vgic_v3_save_state(struct vgic_v3_cpu_if *cpu_if)
 		}
 	}
 
-	if (used_lrs) {
+	if (used_lrs || cpu_if->its_vpe.its_vm) {
 		int i;
 		u32 elrsr;
 
 		elrsr = read_gicreg(ICH_ELRSR_EL2);
+
+		write_gicreg(cpu_if->vgic_hcr & ~ICH_HCR_EN, ICH_HCR_EL2);
 
 		for (i = 0; i < used_lrs; i++) {
 			if (elrsr & (1 << i))
@@ -227,8 +229,6 @@ void __vgic_v3_save_state(struct vgic_v3_cpu_if *cpu_if)
 			__gic_v3_set_lr(0, i);
 		}
 	}
-
-	write_gicreg(cpu_if->vgic_hcr & ~ICH_HCR_EN, ICH_HCR_EL2);
 }
 
 void __vgic_v3_restore_state(struct vgic_v3_cpu_if *cpu_if)
@@ -236,10 +236,12 @@ void __vgic_v3_restore_state(struct vgic_v3_cpu_if *cpu_if)
 	u64 used_lrs = cpu_if->used_lrs;
 	int i;
 
-	write_gicreg(cpu_if->vgic_hcr, ICH_HCR_EL2);
+	if (used_lrs || cpu_if->its_vpe.its_vm) {
+		write_gicreg(cpu_if->vgic_hcr, ICH_HCR_EL2);
 
-	for (i = 0; i < used_lrs; i++)
-		__gic_v3_set_lr(cpu_if->vgic_lr[i], i);
+		for (i = 0; i < used_lrs; i++)
+			__gic_v3_set_lr(cpu_if->vgic_lr[i], i);
+	}
 
 	/*
 	 * Ensure that writes to the LRs, and on non-VHE systems ensure that
